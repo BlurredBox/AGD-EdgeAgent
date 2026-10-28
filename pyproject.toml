@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blurredbox-edge-agent"
+version = "0.1.0"
+description = "BlurredBox edge agent: computes per-window summary statistics locally and sends only those"
+license = {file = "LICENSE"}
+requires-python = ">=3.12"
+dependencies = [
+    "blurredbox-agd>=1.2.1",
+    "numpy>=2.0",
+    "scipy>=1.13",
+    "scikit-learn>=1.5",
+    "pandas>=2.2",
+    "httpx>=0.28.0",
+    "structlog>=23.1.0",
+    "orjson>=3.9.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-timeout>=2.3.0",
+]
+
+[project.scripts]
+blurredbox-edge-agent = "edge_agent.__main__:main"
+
+[tool.setuptools]
+packages = ["edge_agent", "corpus"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

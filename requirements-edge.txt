@@ -1,0 +1,22 @@
+# Pinned third-party dependencies (Python 3.12). Install: pip install -r requirements-edge.txt, then pip install . (pulls in the blurredbox-agd SDK).
+anyio==4.15.1
+certifi==2026.10.19
+cffi==2.1.1
+cryptography==50.0.1
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.19
+joblib==1.6.0
+numpy==2.5.3
+orjson==3.12.0
+pandas==3.0.5
+psutil==7.2.2
+pycparser==3.0
+python-dateutil==2.9.0.post0
+scikit-learn==1.9.0
+scipy==1.18.1
+six==1.17.0
+structlog==26.1.0
+threadpoolctl==3.6.0
+typing_extensions==4.16.0

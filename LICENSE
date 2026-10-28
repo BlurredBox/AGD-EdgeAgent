@@ -1,0 +1,92 @@
+BlurredBox Edge Agent License 1.0
+
+Copyright (c) 2026 BlurredBox. All rights not expressly granted below are
+reserved.
+
+1. Definitions
+
+"Licensor" means BlurredBox, the copyright holder of the Software.
+
+"Software" means the source code, object code, documentation and other files
+in this repository, and any part, copy or modified version of them.
+
+"You" means the individual or entity exercising rights under this License,
+together with any organisation on whose behalf they act and that
+organisation's affiliates.
+
+"Restricted Field" has the meaning given in section 3.
+
+2. Grant
+
+Subject to the terms of this License, the Licensor grants You a
+non-exclusive, worldwide, royalty-free, non-transferable and
+non-sublicensable licence to use, copy, modify and run the Software, and to
+include it in Your own products and services, for any purpose that is not a
+Restricted Field.
+
+3. Restricted Fields
+
+You may not use, copy, modify, run, distribute, or include in any product or
+service, the Software, in whole or in part, directly or indirectly, in or for
+any of the following:
+
+(a) AI and machine-learning governance: any product, service, tool or
+    internal programme whose purpose includes governing, monitoring,
+    observing, validating, testing, auditing, explaining, scoring or
+    alerting on artificial-intelligence or machine-learning models or
+    systems, including drift, anomaly, performance, fairness, risk,
+    compliance or assurance work for such models or systems.
+
+(b) Financial activity of any kind, interpreted as broadly as possible,
+    including without limitation: banking; lending and credit; payments;
+    insurance; investment; asset and wealth management; trading of any
+    asset or instrument, including securities, derivatives, currencies,
+    commodities and crypto-assets; brokerage; exchanges and trading venues;
+    market data; financial advisory; accounting and audit; financial
+    technology; and any product or service sold to, used by, or used on
+    behalf of any person or organisation engaged in any such activity.
+
+(c) Any product or service that competes with a product or service offered
+    by the Licensor.
+
+4. Permission for Restricted Fields
+
+Any use in a Restricted Field requires prior written permission from the
+Licensor. Such permission is valid only if it is given in writing by
+Arameh Haghverdian or Harutyun Kesablyan on behalf of the Licensor. No
+permission is implied by any other communication, course of dealing, payment
+or access to the Software.
+
+5. Conditions
+
+If You distribute the Software, in whole or in part, alone or as part of
+Your product or service, You must:
+
+(a) include a complete copy of this License and the copyright notice above;
+(b) ensure every recipient receives the Software only under this License;
+    and
+(c) not remove or alter any licensing, copyright or attribution notice.
+
+6. No Other Rights
+
+This License grants no rights in the Licensor's trademarks, names or logos,
+and no patent rights beyond those strictly necessary to use the Software as
+permitted by section 2. No rights are granted by implication or estoppel.
+
+7. Termination
+
+If You breach any term of this License, all rights granted to You under it
+end immediately and automatically. On termination You must stop using the
+Software and destroy all copies in Your possession or control.
+
+8. No Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+
+9. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT SHALL THE LICENSOR BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.

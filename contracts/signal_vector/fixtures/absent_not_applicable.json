@@ -1,0 +1,11 @@
+{
+  "description": "Absent case (tier-1 convention): Group F field 'gpu_utilization' is not applicable because no GPU is present on this install. Expected wire representation is that the field is OMITTED ENTIRELY from the emitted z_t payload -- no key at all, no null, no companion '_valid' flag. This is a structural check: the runner verifies the field key is absent from expected_output's payload keys, distinguishing it from the null+_valid:false shape in cannot_compute_null_flag.json.",
+  "field": "F.gpu_utilization",
+  "input": {
+    "gpu_present": false
+  },
+  "expected_output": {
+    "_omitted_fields": ["gpu_utilization", "gpu_utilization_valid"]
+  },
+  "tolerance": "exact"
+}

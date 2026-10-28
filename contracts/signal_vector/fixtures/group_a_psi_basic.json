@@ -1,0 +1,14 @@
+{
+  "description": "Group A field family: psi (PSI) for one numeric feature, reference window vs current window. Formula: 10 equal-frequency bins on reference deciles, bin proportions floored at 1e-4, PSI = sum((actual_pct - expected_pct) * ln(actual_pct/expected_pct)). Bin edges are the reference sample's decile boundaries (indices round(i*n/10) for i=1..9); the last bin is closed on both ends to include the max value.",
+  "field": "A.psi",
+  "input": {
+    "reference_window": [10.1,10.5,9.8,10.2,10.0,9.9,10.3,10.6,9.7,10.4,10.1,9.95,10.25,10.15,9.85,10.35,10.05,9.75,10.45,10.55,10.2,9.9,10.1,10.3,9.8,10.0,10.4,9.95,10.25,10.15],
+    "current_window": [10.4,10.8,10.1,10.5,10.3,10.2,10.6,10.9,10.0,10.7,10.4,10.25,10.55,10.45,10.15,10.65,10.35,10.05,10.75,10.85,10.5,10.2,10.4,10.6,10.1,10.3,10.7,10.25,10.55,10.45],
+    "bins": 10,
+    "floor": 0.0001
+  },
+  "expected_output": {
+    "psi": 2.6545626156089566
+  },
+  "tolerance": 1e-6
+}

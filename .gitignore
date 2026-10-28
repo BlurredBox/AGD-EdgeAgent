@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Secrets and certificates
+.env
+.env.*
+*.p12
+*.pfx
+*.pem
+*.key
+*.crt
+
+# Local agent config and state
+agent.json
+state/
+spool/
+*.offset
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+alerts.jsonl
+feature_ids.json
+status.json

@@ -1,0 +1,13 @@
+{
+  "description": "Cannot-compute case (tier-2 convention): Group C field 'brier' requires ground-truth labels; none are available this window (e.g. label lag not yet landed). Expected wire representation is null plus a companion '<field>_valid' flag set false. This is a structural check (does the emitted payload have the right shape), not a numeric one -- there is no numeric tolerance to apply.",
+  "field": "C.brier",
+  "input": {
+    "labels_available": false,
+    "reason": "label lag: no ground truth landed for this window yet"
+  },
+  "expected_output": {
+    "brier": null,
+    "brier_valid": false
+  },
+  "tolerance": "exact"
+}

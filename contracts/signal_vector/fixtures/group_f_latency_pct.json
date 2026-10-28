@@ -1,0 +1,14 @@
+{
+  "description": "Group F field family: inference_latency_pct {p50, p95, p99}. Percentile interpolation method pinned here to LINEAR interpolation (numpy 'linear'/Excel-style: rank = p*(n-1), interpolate between floor and ceil ranks) because the field contract does not pin this down. This is an explicit conformance-suite decision, not a schema fact -- flagged as an open ambiguity to escalate to the contract owner if a different convention (e.g. nearest-rank) is later preferred.",
+  "field": "F.inference_latency_pct",
+  "input": {
+    "latencies_ms": [12,15,14,13,16,18,20,17,19,22,25,21,23,30,45,50,28,24,26,27,29,31,33,35,40,38,36,34,32,60],
+    "interpolation": "linear"
+  },
+  "expected_output": {
+    "p50": 26.5,
+    "p95": 47.749999999999986,
+    "p99": 57.10000000000001
+  },
+  "tolerance": 1e-6
+}

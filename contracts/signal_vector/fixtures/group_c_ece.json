@@ -1,0 +1,16 @@
+{
+  "description": "Group C field family: ece (Expected Calibration Error) over 15 equal-width confidence bins [0,1/15), ..., [14/15,1]. Per bin: |mean_confidence - accuracy| weighted by bin_count/N, summed across non-empty bins.",
+  "field": "C.ece",
+  "input": {
+    "bins": 15,
+    "pairs": [
+      [0.05,0],[0.08,0],[0.12,0],[0.18,1],[0.22,0],[0.28,0],[0.33,1],[0.38,0],[0.44,1],[0.48,0],
+      [0.53,1],[0.58,1],[0.63,0],[0.68,1],[0.72,1],[0.78,1],[0.83,1],[0.88,0],[0.93,1],[0.97,1]
+    ],
+    "pair_format": "[confidence, correct_flag] where correct_flag is 1 if the prediction was correct, 0 otherwise"
+  },
+  "expected_output": {
+    "ece": 0.2755
+  },
+  "tolerance": 1e-6
+}

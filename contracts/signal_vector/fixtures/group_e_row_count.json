@@ -1,0 +1,12 @@
+{
+  "description": "Group E field family: row_count_vs_expected. Formula: actual_row_count / expected_row_count.",
+  "field": "E.row_count_vs_expected",
+  "input": {
+    "actual_row_count": 9820,
+    "expected_row_count": 10000
+  },
+  "expected_output": {
+    "row_count_vs_expected": 0.982
+  },
+  "tolerance": 1e-6
+}
