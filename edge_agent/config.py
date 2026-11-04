@@ -19,7 +19,7 @@ class EdgeConfig:
     endpoints: list[str]
     state_dir: Path
 
-    # -- windows (default cadence: 5 minutes)
+    # -- windows (Phase 1 Task 8 default cadence: 5 minutes)
     cadence_seconds: int = 300
     min_rows_per_window: int = 30
     reference_windows: int = 200
@@ -37,18 +37,36 @@ class EdgeConfig:
 
     # -- local tripwires
     feed_down_after_seconds: float | None = None   # default 3 x cadence
+    # Decision 2 (2026-10-29): a model whose windows carried labels raises a local `labels_missing` once this
+    # many consecutive closed windows have label coverage 0, and `labels_recovered` when a labelled window
+    # returns. 0 turns it off. Default 6: one cadence-relative episode threshold like `feed_down` (30 min at
+    # the 5-minute default cadence, 6 min at 1 minute); it fires inside the demo seed's 12-window label lag;
+    # and a model whose windows are each labelled with probability p fires by chance about once per
+    # (1 - p) ** -6 windows, i.e. under once a week at a 5-minute cadence (2,016 windows) for p >= 0.72.
+    labels_missing_after_windows: int = 6
     feature_bounds: dict[str, tuple[float, float]] = field(default_factory=dict)
     output_bounds: tuple[float, float] | None = None
     max_invalid_row_fraction: float = 0.2
     alert_cooldown_seconds: float = 300.0
+
+    # -- leading indicators (G53; counts, rates and lags only, see corpus/lead_signals.py)
+    null_rate_ceiling: float = 0.2          # a feature column above this null share is counted
+    # "ingest": a record without its own arrival stamp is stamped when the agent receives it.
+    # "source_only": only a mapped arrival column counts (history replay: a replay-time stamp
+    # would be meaningless, so no arrival lag is emitted without the column).
+    arrival_stamp: str = "ingest"
+    slice_feature: str | None = None        # LOCAL feature name whose value defines a slice; never sent
+    slice_min_rows: int = 30                # rows per slice per window (and in the reference) to score it
+    slice_shift_limit: float = 1.0          # shift in reference output sd units counted as "over"
+    slice_max: int = 50                     # distinct slices tracked; further values are not scored
 
     # -- public prices
     instrument_series: dict[str, str] = field(default_factory=dict)  # instrument -> FRED id
     price_max_staleness_days: int = 5
 
     # -- transport
-    schema_version: str = "1.2"
-    spool_max_age_seconds: float = 33 * 86400       # ~33-day offline queue
+    schema_version: str = "1.4"           # 1.4: G53 leading-indicator scalars (corpus/lead_signals.py)
+    spool_max_age_seconds: float = 33 * 86400       # D-50: ~33-day offline queue
     backlog_after_seconds: float | None = None      # default 2 x cadence
     timeout_seconds: float = 5.0
     client_cert: tuple[str, str] | None = None
@@ -74,6 +92,17 @@ class EdgeConfig:
         if (type(self.outcome_join_max_records) is not int or self.outcome_join_max_records < 1
                 or not math.isfinite(self.outcome_join_max_age_seconds) or self.outcome_join_max_age_seconds <= 0):
             raise ValueError("outcome join capacity and retention must be positive")
+        if self.arrival_stamp not in ("ingest", "source_only"):
+            raise ValueError("arrival_stamp must be 'ingest' or 'source_only'")
+        if not (0 <= self.null_rate_ceiling < 1) or self.slice_min_rows < 1 or self.slice_max < 1 \
+                or not (math.isfinite(self.slice_shift_limit) and self.slice_shift_limit > 0):
+            raise ValueError("null_rate_ceiling in [0, 1), slice_min_rows and slice_max >= 1, "
+                             "slice_shift_limit > 0")
+        if self.slice_feature is not None and (not isinstance(self.slice_feature, str)
+                                               or not self.slice_feature.strip()):
+            raise ValueError("slice_feature must be a nonempty feature name")
+        if type(self.labels_missing_after_windows) is not int or self.labels_missing_after_windows < 0:
+            raise ValueError("labels_missing_after_windows must be an integer >= 0 (0 turns it off)")
         if self.feed_down_after_seconds is None:
             self.feed_down_after_seconds = 3.0 * self.cadence_seconds
         if self.backlog_after_seconds is None:

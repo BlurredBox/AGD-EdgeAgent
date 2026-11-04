@@ -7,7 +7,7 @@ An adapter's only job is to turn a source dataset into the shape the harness
 walks: a time-ordered stream of (timestamp, features, y_true), plus a
 train/reference/replay split that never overlaps.
 
-Real-data adapters deliberately do NOT bundle or download data. The
+Real-data adapters deliberately do NOT bundle or download data. Task 1's
 build process forbids committing anything not marked `fetch: repo`, and
 several sources (Fannie Mae, TableShift's gated constituents) cannot be
 fetched without credentials at all. Each adapter therefore declares where its
@@ -47,7 +47,7 @@ DATA_ROOT = Path(__file__).resolve().parent.parent / "corpus" / "data"
 @dataclass(frozen=True)
 class Row:
     """One observation. `y_true` is what makes replay labelling possible at all
-    -- in production this is absent by construction, which is why the performance estimator has
+    -- in production this is absent by construction, which is why Phase 4 has
     to estimate performance rather than measure it."""
     ts: datetime
     features: dict[str, float | str]
@@ -59,7 +59,7 @@ class Split:
     """Three disjoint, ordered slices.
 
     train   -> fits the base model
-    reference -> builds the reference window (the drift baseline)
+    reference -> builds the reference window (Phase 1's baseline)
     replay  -> the stream the harness walks
 
     Disjointness is not a nicety. A base model that saw its replay data is not
@@ -81,15 +81,15 @@ class Split:
             raise ValueError("reference overlaps train in time")
         if first_replay < last_ref:
             raise ValueError("replay overlaps reference in time")
-        # The reference-window minimum bar, enforced not assumed
+        # Phase 1's reference-window minimum bar, enforced not assumed
         if len(self.reference) < 2000:
             raise ValueError(
                 f"reference window has {len(self.reference)} rows, "
-                "the reference window requires N >= 2000")
+                "Phase 1 requires N >= 2000")
         span_h = (last_ref - first_ref).total_seconds() / 3600
         if span_h < 24:
             raise ValueError(
-                f"reference window spans {span_h:.1f}h, the reference window requires >= 24h")
+                f"reference window spans {span_h:.1f}h, Phase 1 requires >= 24h")
 
 
 class DatasetAdapter(Protocol):
@@ -117,8 +117,8 @@ class SyntheticAdapter:
     # Sizing is driven by TWO constraints that pull in opposite directions,
     # and getting either wrong produces a corpus of empty windows:
     #
-    #   * The reference bar: N >= 2000 AND >= 24h of coverage.
-    #   * The 5-minute emission cadence: each window needs enough rows
+    #   * Phase 1's reference bar: N >= 2000 AND >= 24h of coverage.
+    #   * Phase 1's 5-minute emission cadence: each window needs enough rows
     #     to compute moments, ECE and quantiles, or it falls below the minimum
     #     emission bar and no vector is emitted at all.
     #
@@ -183,7 +183,7 @@ class _RealDataAdapter:
             raise FileNotFoundError(
                 f"{self.dataset_id}: expected data at {p}\n"
                 f"  {self.acquisition_note}\n"
-                f"  Nothing is auto-downloaded: the corpus build forbids "
+                f"  Nothing is auto-downloaded: Task 1's build process forbids "
                 f"committing sources not marked `fetch: repo`, and several "
                 f"sources cannot be fetched without credentials."
             )
@@ -207,7 +207,7 @@ class FolktablesAdapter(_RealDataAdapter):
         raise NotImplementedError(
             "Folktables has survey-year granularity and no natural wall-clock "
             "time. Synthetic timestamps at a fixed cadence must be assigned "
-            "here, and the run must record that the resulting 24h reference-window "
+            "here, and Task 3 records that the resulting 24h reference-window "
             "coverage is NOMINAL, not physical. Implement with that recorded.")
 
 
@@ -227,22 +227,22 @@ class BackblazeAdapter(_RealDataAdapter):
         self._require()
         raise NotImplementedError(
             "Backblaze is the corpus's ONLY censored time-to-event source "
-            "Right-censoring must be preserved: drives surviving "
-            "the observation window are signal for survival modelling, "
+            "(Task 1 §1). Right-censoring must be preserved: drives surviving "
+            "the observation window are signal for Phase 5's survival head, "
             "not rows to drop.")
 
 
 class HmdaAdapter(_RealDataAdapter):
     """HMDA Loan/Application Register -- the corpus's regime-break source.
 
-    Acquired by a separate acquisition script (2007-2017, all-records,
-    codes). Legal basis: 17 U.S.C. s105 and *Feist*, no grant required.
+    Acquired by scripts/acquire_hmda.py per D-40 (2007-2017, all-records,
+    codes). Legal basis is D-36: 17 U.S.C. s105 and *Feist*, no grant required.
 
     Why this source carries the regime break: lending standards collapsed
     between 2007 and 2009. A model fitted on 2007 approval behaviour and
     replayed through 2008-2009 degrades because the world changed, not because
     the data was perturbed. That is the one shift class fault injection cannot
-    manufacture (fault injection refuses to fabricate a crisis tape), and it is why
+    manufacture (Task 5 refuses to fabricate a crisis tape), and it is why
     `adversarial_regime_replay` raised NotImplementedError until this landed.
 
     Three decisions are recorded here rather than left implicit:
@@ -258,16 +258,16 @@ class HmdaAdapter(_RealDataAdapter):
     be a fabricated label, which is the error class this project has caught
     four times already.
 
-    TIME. HMDA has `as_of_year` and nothing finer. As with other year-granular sources the harness
+    TIME. HMDA has `as_of_year` and nothing finer. Per Phase 2 s5 the harness
     assigns synthetic timestamps at a fixed cadence, and the 24 h
     reference-window bar is then satisfied BY CONSTRUCTION -- its satisfaction
-    is **nominal, not physical**, exactly as recorded for Folktables. Evaluation
+    is **nominal, not physical**, exactly as recorded for Folktables. Phase 10
     must not read HMDA's temporal coverage as real elapsed time.
 
     GEOGRAPHY. `state_code` is the only geographic feature used. `county_code`
     and `msamd` are present in the acquired files but deliberately NOT fed to
     the model: county-level geography combined with income and loan amount is a
-    re-identification vector, and the legal basis carries HMDA's prohibition on
+    re-identification vector, and D-36 carries HMDA's prohibition on
     re-identifying borrowers forward as a use restriction independent of
     copyright. State-level captures the regional character of the crisis
     without that exposure.
@@ -276,8 +276,8 @@ class HmdaAdapter(_RealDataAdapter):
     dataset_id = "hmda"
     expected_path = "hmda"
     acquisition_note = (
-        "Download the HMDA LAR files into <dir> as "
-        "hmda_YYYY.csv.gz plus a manifest.json recording the source and terms of use. "
+        "Run: python scripts/acquire_hmda.py --out <dir>. Produces "
+        "hmda_YYYY.csv.gz plus manifest.json carrying the D-36 legal basis. "
         "Point HMDA_DATA_DIR at that directory if it is not under corpus/data."
     )
     targets = ("approval",)
@@ -296,11 +296,11 @@ class HmdaAdapter(_RealDataAdapter):
     APPROVED = frozenset({"1", "2", "8"})
     DENIED = frozenset({"3", "7"})
 
-    # The domain classifier's stated minimum. Below 200 the domain classifier does not
-    # run, and it is mandatory for alert attribution -- a corpus built under that
+    # Phase 3's stated DC minimum. Below 200 the domain classifier does not
+    # run, and it is invariant-mandated under I-4 -- a corpus built under that
     # threshold would carry no multivariate attribution on any window.
     ROWS_PER_WINDOW = 200
-    WINDOW_SECONDS = 300                      # default emission cadence
+    WINDOW_SECONDS = 300                      # Phase 1 s6 default cadence
 
     def __init__(self, *, data_dir: Path | None = None,
                  rows_per_year: int = 2_000_000, seed: int = 7) -> None:
@@ -346,10 +346,10 @@ def get_adapter(dataset_id: str, **kwargs):
 class NasaPCoEAdapter(_RealDataAdapter):
     """NASA Prognostics Center of Excellence run-to-failure repository.
 
-    21 files clustering into 14 INDEPENDENT physical domains.
+    Task 1 round 2: 21 files clustering into 14 INDEPENDENT physical domains.
     Five battery datasets share failure physics and are no more independent
     than five learning rates -- counting files rather than domains would
-    inflate `G` by 105, an error that has been caught three times.
+    inflate `G` by 105, the same error the phase has caught three times.
 
     Terms (retrieved 2026-08-11): NASA does not licence its materials;
     attribution is REQUESTED, not imposed. No redistribution or commercial
@@ -358,7 +358,7 @@ class NasaPCoEAdapter(_RealDataAdapter):
 
     This is the corpus's answer to the censored time-to-event gap. Nearly every
     dataset here is run-to-failure, so units surviving the observation window
-    are RIGHT-CENSORED -- usable signal for the forecaster's survival head, not rows
+    are RIGHT-CENSORED -- usable signal for Phase 5's survival head, not rows
     to drop. Before this, Backblaze was the only source and the survival head
     would have learned censoring entirely from hard-drive failure.
     """
@@ -393,7 +393,7 @@ class NasaPCoEAdapter(_RealDataAdapter):
             "bearings vibration spectra, batteries charge/discharge cycles), so "
             "each domain needs its own feature mapping. Implement per domain, "
             "and PRESERVE right-censoring: units surviving the observation "
-            "window are signal for survival modelling, not rows to drop.")
+            "window are signal for Phase 5's survival head, not rows to drop.")
 
 
 class FhfaPudbAdapter(_RealDataAdapter):
@@ -416,7 +416,7 @@ class FhfaPudbAdapter(_RealDataAdapter):
     wherever this dataset's results are reported.
 
     Licence terms are NOT stated on the FHFA page. Likely public domain as US
-    federal work; confirmation requested from FHFA 2026-08-11.
+    federal work; confirmation requested from PUDBdata@fhfa.gov 2026-08-11.
     Until it returns, this source is PROVISIONAL and must not enter a shipped
     corpus.
     """

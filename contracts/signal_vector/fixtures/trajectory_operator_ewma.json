@@ -1,5 +1,5 @@
 {
-  "description": "Trajectory operators #1 (first difference) and #2 (EWMA). EWMA half-life=5 windows, alpha = 1 - 2^(-1/5). EWMA series starts at series[0] (no smoothing on the first point, since there is no prior EWMA value to blend with).",
+  "description": "Trajectory operators #1 (first difference) and #2 (EWMA), per Task 4 §1. EWMA half-life=5 windows, alpha = 1 - 2^(-1/5). EWMA series starts at series[0] (no smoothing on the first point, since there is no prior EWMA value to blend with).",
   "operators": ["first_difference", "ewma"],
   "input": {
     "series": [100.0,102.0,101.0,105.0,107.0,106.0,110.0,108.0,112.0,115.0],

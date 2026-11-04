@@ -54,6 +54,19 @@ def test_preflight_rejects_empty_source_and_uses_operator_required_contract(tmp_
     assert report["contract"]["required_source"] == "operator-pinned-artifact"
 
 
+def test_window_hints_identify_invalid_fields_and_learned_live_fallback():
+    from types import SimpleNamespace
+    from src.api.onboarding_diagnostics import window_hints
+
+    bundle = SimpleNamespace(horizons=(1,), features_by_horizon={1: ("positive_decision_rate",)})
+    runtime = SimpleNamespace(service=SimpleNamespace(bundle=bundle, version=SimpleNamespace(digest="test")),
+                              learned_artifact=object(), learned_forecaster=None)
+    report = window_hints({"positive_decision_rate": 2}, runtime)
+    assert report["fields_invalid"] == ["positive_decision_rate"]
+    assert all(not report["paths"][path]["input_ready"] for path in onboarding.PATHS)
+    assert all(report["paths"][path]["horizons_unscorable"] == [1] for path in onboarding.PATHS)
+
+
 def test_adapters_preserve_local_prediction_ids_and_outcome_known_time(tmp_path):
     at = utc(T0)
     hook = InProcessAdapter()
@@ -123,6 +136,7 @@ def _probability_run(tmp_path, *, missing_last=False):
     return agent, sink, recs
 
 
+@pytest.mark.slow
 def test_real_producer_emits_calibration_only_for_complete_original_window(tmp_path):
     agent, sink, recs = _probability_run(tmp_path)
     z = sink.bodies()[0]["z_t"]
@@ -137,6 +151,7 @@ def test_real_producer_emits_calibration_only_for_complete_original_window(tmp_p
     agent.close()
 
 
+@pytest.mark.slow
 def test_two_jsonl_sources_merge_labels_before_original_window_closes(tmp_path):
     recs = [replace(r, output=0.8, prediction_id=f"private{i}")
             for i, r in enumerate(make_stream(2))]
@@ -298,6 +313,7 @@ def test_out_of_range_probability_is_dropped_under_its_own_reason(tmp_path):
     assert agent.outcomes.status()["retained"] == 0
 
 
+@pytest.mark.slow
 def test_status_report_is_read_only_counts_and_discloses_nothing(tmp_path, capsys, monkeypatch):
     from edge_agent import __main__ as cli
     from edge_agent.status import read_status
@@ -330,10 +346,14 @@ def _write_jsonl(path, recs, mode="w"):
                                  "features": r.features, "output": r.output}) + "\n")
 
 
-def test_sigterm_on_the_real_loop_flushes_the_open_window_and_a_restart_neither_loses_nor_repeats(tmp_path):
+def test_sigterm_on_the_real_loop_keeps_the_open_window_and_a_restart_neither_loses_nor_repeats(tmp_path):
+    """SIGTERM must not close the open window early: its end is in the future, the server refuses that
+    (422 invalid_window_time), and a restart would then send a second partial of the same window. The open
+    window is kept in the state with its rows and sent once, whole, at its real end (lane edgestop, 10-30)."""
     import os
     import signal
     import threading
+    from edge_agent.agent import OPEN_WINDOWS_FILE
 
     log = tmp_path / "model.jsonl"
     stream = make_stream(3)                       # windows 0, 1, 2
@@ -349,23 +369,71 @@ def test_sigterm_on_the_real_loop_flushes_the_open_window_and_a_restart_neither_
     agent = new_agent(sink)
     threading.Timer(0.5, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
     agent.run_forever(interval_seconds=0.05)      # SIGTERM arrives mid-loop; the loop returns
-    assert len(sink.bodies()) == 2, "the half-filled window was not flushed and sent"
+    assert len(sink.bodies()) == 1, "only window 0 may be sent: window 1 has not ended"
     assert agent.sender.pending_count() == 0      # sent, nothing stranded in the spool
     offset = int((cfg.state_dir / "source.offset").read_text())
-    assert offset == log.stat().st_size           # every line read was accounted for
+    assert offset == log.stat().st_size           # every line read was accounted for ...
+    kept = json.loads((cfg.state_dir / OPEN_WINDOWS_FILE).read_text())
+    assert [len(w["records"]) for w in kept["models"][LOCAL_MODEL]["windows"]] == [110]   # ... the open ones here
     assert (cfg.state_dir / "status.json").is_file()
+    assert not list((cfg.state_dir / "spool" / "rejected").glob("*.json"))
 
-    # Restart on the same state: no row is re-read, no window is re-emitted.
+    # Restart on the same state, still inside window 1: no row is re-read, nothing is sent.
     sink2 = Collector()
     again = new_agent(sink2)
     again.run_once()
-    again.close()
+    again.close(keep_open=True)
     assert sink2.bodies() == []
-    # More rows arrive later: only the new window is emitted, nothing already sent repeats.
+    # More rows arrive later: window 1 is sent once, whole, then window 2; nothing already sent repeats.
     _write_jsonl(log, stream[330:], mode="a")
     clock[0] = utc(T0 + 180 + 30)
     sink3 = Collector()
     third = new_agent(sink3)
     third.run_once()
+    assert [b["window_timestamp"] for b in sink3.bodies()] == [utc(T0 + 120).isoformat(), utc(T0 + 180).isoformat()]
+    ids = [b["window_id"] for b in sink.bodies() + sink3.bodies()]
+    assert len(ids) == len(set(ids)) == 3
     third.close()
-    assert len(sink3.bodies()) == 2               # the rest of window 1 (a new partial) and window 2
+
+
+def _jsonl_agent_json(tmp_path, source, output_kind="probability"):
+    from tests.edge_agent.synth import CADENCE
+    cfg = {"tenant_id": "t", "install_id": "i", "models": {LOCAL_MODEL: "mm-wire-0001"},
+           "secret_env": "EDGE_TEST_SECRET", "endpoints": ["https://x.invalid"],
+           "state_dir": str(tmp_path / "state"), "cadence_seconds": CADENCE, "output_kind": output_kind,
+           "source": {"type": "jsonl", "path": str(source)}}
+    path = tmp_path / "agent.json"
+    path.write_text(json.dumps(cfg))
+    return path
+
+
+def test_check_on_an_empty_log_says_no_rows_yet_not_fix_the_config(tmp_path):
+    """Rehearsal D-10: day 1, the model has not written yet. `python -m edge_agent --check`, as the
+    installer runs it, gives its own verdict and a waiting-for-data message, and still exits non-zero."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    source = tmp_path / "predictions.jsonl"
+    source.write_text("")
+
+    def run(cfg_path):
+        r = subprocess.run([sys.executable, "-m", "edge_agent", "--config", str(cfg_path), "--check"],
+                           cwd=root, capture_output=True, text=True, timeout=60)
+        return r.returncode, json.loads(r.stdout.strip().splitlines()[-1])
+
+    code, out = run(_jsonl_agent_json(tmp_path, source))
+    assert code == 2 and out["verdict"] == "NO_ROWS_YET", out
+    assert out["source_check"]["rows_checked"] == 0
+    assert out["message"].startswith("no rows yet") and "Waiting for data" in out["message"]
+    assert not (tmp_path / "state" / "source.offset").exists()
+
+    # A config fault still wins over "no rows yet": a signed producer cannot meet the contract.
+    code, out = run(_jsonl_agent_json(tmp_path, source, output_kind="signed"))
+    assert code == 2 and out["verdict"] == "NOT_READY" and "message" not in out
+
+    # The first row arrives: the same check passes.
+    source.write_text(json.dumps({"ts": utc(T0).isoformat(), "model_id": LOCAL_MODEL, "instrument": "i",
+                                  "features": {"x": 1}, "output": 0.2}) + "\n")
+    code, out = run(_jsonl_agent_json(tmp_path, source))
+    assert code == 0 and out["verdict"] == "SOURCE_COMPATIBLE", out

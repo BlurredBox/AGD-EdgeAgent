@@ -125,6 +125,33 @@ def test_deterministic_refusal_does_not_block_the_queue(tmp_path):
     assert "window_rejected" in kinds(agent)
 
 
+def test_rejected_window_keeps_the_http_answer(tmp_path, caplog):
+    """rc5 upgrade rehearsal 2026-10-30: 4 windows went to rejected/ with no record of the
+    answer. The moved file and the log line now carry the status and reason."""
+    import json
+    import logging
+
+    sink = Collector()
+    clock = [utc(T0)]
+    agent = _agent(tmp_path, sink, clock)
+    sink.status = 409
+    _feed(agent, clock, make_stream(1, rows=10))
+    clock[0] = utc(T0 + 3 * CADENCE)
+    with caplog.at_level(logging.WARNING, logger="edge_agent.transport"):
+        agent.flush()
+    files = list((tmp_path / "state" / "spool" / "rejected").glob("*.json"))
+    assert len(files) == 1
+    entry = json.loads(files[0].read_text())
+    assert entry["body"]["window_id"]                      # the window itself is kept for replay
+    (answer,) = entry["rejection"]["answers"]
+    assert answer["status"] == 409 and answer["endpoint"] and answer["reason"]
+    assert entry["rejection"]["at"]
+    line = next(r.getMessage() for r in caplog.records if "window_rejected" in r.getMessage())
+    assert "http=409" in line and entry["body"]["window_id"] in line
+    alert = next(a for a in agent.alerter.history if a.kind == "window_rejected")
+    assert alert.details["http_status"] == [409]
+
+
 def test_5xx_is_retried_not_dropped(tmp_path):
     sink = Collector()
     clock = [utc(T0)]

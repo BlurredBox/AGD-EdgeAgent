@@ -1,0 +1,27 @@
+# BlurredBox edge agent with Docker Compose or podman-compose (docs/partner/EDGE-INSTALL-FOR-IT.md, "Container").
+# The same files as the Linux install, read-only: /etc/blurredbox-edge/config.json, agent.env (0600) and certs/,
+# owned by uid 10001 (or set `user:` to the owner's uid:gid). The only writable place is the edge-state volume.
+# Load the image first: `docker load -i blurredbox-edge-agent-image-<version>.tar` (or `podman load -i ...`).
+services:
+  blurredbox-edge:
+    image: localhost/blurredbox-edge-agent:0.1.3
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
+    volumes:
+      - /etc/blurredbox-edge:/etc/blurredbox-edge:ro         # config.json, agent.env, certs/
+      - /var/log/models:/var/log/models:ro                   # your prediction source, read-only, same path as in config.json
+      - edge-state:/var/lib/blurredbox-edge                  # state, spool, spool/rejected/, read offsets
+      # With the .p12 instead of certs/client.pem + client.key (both files mode 0600 or 0400), uncomment these three:
+      # - /root/bb-handover/partner-name.p12:/run/secrets/client.p12:ro
+      # - /root/bb-handover/p12.pass:/run/secrets/p12.pass:ro
+    # environment: {BBE_P12: /run/secrets/client.p12, BBE_P12_PASS_FILE: /run/secrets/p12.pass}   # paths, never values
+    restart: unless-stopped
+    stop_grace_period: 60s        # SIGTERM: sends what is queued, keeps the open window in the state
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
+volumes:
+  edge-state: {}

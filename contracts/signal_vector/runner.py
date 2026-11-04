@@ -2,15 +2,15 @@
 """
 contracts/signal_vector/runner.py
 
-Conformance-suite runner for the signal-vector wire contract
-Loads every fixture in fixtures/, checks it against a
+Conformance-suite runner for BlurredBox-AGD's signal-vector wire contract
+(Phase 1 Task 9). Loads every fixture in fixtures/, checks it against a
 reference implementation written inline below, and reports PASS/FAIL/SKIPPED
 per fixture with a non-zero exit code on any failure.
 
 Invocation: python3 contracts/signal_vector/runner.py
-Both the replay-harness CI and the edge-agent CI are required to
+Both Phase 2's replay-harness CI and Phase 7's edge-agent CI are required to
 run this script against their own implementation's output and treat a
-non-zero exit as a build failure.
+non-zero exit as a build failure (see PLAN/answers/phase-01-conformance-suite.md).
 
 Stdlib only -- no dependencies, so any implementation in any language can
 invoke `python3 runner.py` from CI without pulling in this repo's Python
@@ -19,10 +19,10 @@ toolchain beyond the interpreter itself.
 *** SCHEMA-INVALIDATION RULE ***
 Any commit that changes an expected_output value in fixtures/, or adds or
 removes a fixture, MUST be paired in the same PR with:
-  1. A schema_version bump (per the schema versioning rules), and
-  2. A corpus_invalidated: true note.
+  1. A schema_version bump (PLAN/answers/phase-01-versioning.md rules), and
+  2. A corpus_invalidated: true note referencing Phase 2 §7.
 This is a repo convention (PR checklist item), not something this script
-enforces mechanically.
+enforces mechanically -- see PLAN/answers/phase-01-conformance-suite.md for why.
 """
 import json
 import math
@@ -275,26 +275,26 @@ def check_absent(fx):
     return ok, f"absent shape for {field}: omitted={omitted}"
 
 
-# TODO(sketch implementer): once a real t-digest implementation
+# TODO(Phase 7/Phase 2 implementer): once a real t-digest implementation
 # exists, replace this stub with:
 #   digest = TDigest(compression=fixture["input"]["compression_delta"])
 #   for x in fixture["input"]["sample"]: digest.push(x)
 #   got = digest.quantile(fixture["input"]["target_quantile"])
 #   assert abs(got - fixture["expected_output"]["p99_reference"]) \
 #       <= fixture["tolerance"] * fixture["expected_output"]["p99_reference"]
-# i.e. relative tolerance = 0.3% (the stated tail rank-error bound).
+# i.e. relative tolerance = 0.3% (Task 5's stated tail rank-error bound).
 def check_sketch_tdigest_stub(fx):
     return None, "t-digest implementation not part of this suite (stub)"
 
 
-# TODO(sketch implementer): once a real HLL implementation exists,
+# TODO(Phase 7/Phase 2 implementer): once a real HLL implementation exists,
 # replace this stub with:
 #   hll = HyperLogLog(precision=fixture["input"]["precision_p"])
 #   for x in fixture["input"]["sample"]: hll.add(x)
 #   got = hll.cardinality()
 #   assert abs(got - fixture["expected_output"]["distinct_count_reference"]) \
 #       <= fixture["tolerance"] * fixture["expected_output"]["distinct_count_reference"]
-# i.e. relative tolerance = 0.81% (the stated HLL standard error at p=14).
+# i.e. relative tolerance = 0.81% (Task 5's stated HLL standard error at p=14).
 def check_sketch_hll_stub(fx):
     return None, "HLL implementation not part of this suite (stub)"
 

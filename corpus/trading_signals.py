@@ -1,9 +1,10 @@
 """
 corpus/trading_signals.py
 
-Layer 1 (edge) signals for trading-model deployments.
+Layer 1 (edge) signals for the v4 trading design-partner deployment
+(`ROADMAP/m_series/04-architecture-v4.md`).
 
-WHERE THIS RUNS. On the deployment side, inside the edge agent. It reads the
+WHERE THIS RUNS. On the partner side, inside the edge agent. It reads the
 model's own outputs and PUBLIC prices of the instrument. Raw predictions,
 prices and rows never leave: only the scalars returned by
 `compute_trading_signals` do, as extra fields of `z_t` (registered in

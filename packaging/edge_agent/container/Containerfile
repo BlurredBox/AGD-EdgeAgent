@@ -1,0 +1,71 @@
+# BlurredBox edge agent: container image (Linux x86-64). Built by scripts/build_edge_image.sh from the SAME offline
+# wheelhouse and pinned requirements as the Linux kit (edge/wheelhouse/, edge/requirements-edge.txt); the build runs
+# with --network none, so nothing but the kit's files and the pinned base image goes in.
+#
+# Behaviour is the systemd install's (packaging/edge_agent/installer/blurredbox-edge.service): same config, secrets and
+# certificate files at the same paths, mounted read-only; the only writable place is the state volume
+# /var/lib/blurredbox-edge (state, spool, spool/rejected/, read offsets). Non-root (uid 10001), runs on a read-only
+# root, listens on no port. The final stage is FROM scratch: Python, the agent and the libraries they load; no shell.
+# Needs the docker image format for HEALTHCHECK (podman build --format docker; the build script passes it).
+
+# python:3.12-slim-bookworm (Debian 12, CPython 3.12.16), pinned by digest. Change it only together with the wheelhouse.
+ARG BASE_IMAGE=docker.io/library/python:3.12-slim-bookworm@sha256:62ed8e07e544e8555c5d93748d5275015136b7f5c52b5e8679b4de339c3779d3
+
+FROM ${BASE_IMAGE} AS build
+# EXTRAS: optional inputs, as install.sh --with-postgres / --with-parquet / --with-kafka (space separated).
+# scripts/build_edge_image.sh passes all three for the release image (R5-02); each must import, and the set is written
+# to /opt/blurredbox-edge/INPUTS.
+ARG EXTRAS=""
+ENV PIP_NO_INDEX=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 PIP_NO_INPUT=1
+COPY kit/ /kit/
+RUN set -eu; \
+    cd /kit/wheelhouse && sha256sum --check --quiet --strict SHA256SUMS; \
+    python -m venv /opt/blurredbox-edge/venv; \
+    REQS="-r /kit/requirements-edge.txt"; \
+    for x in $EXTRAS; do REQS="$REQS -r /kit/wheelhouse/requirements-edge-$x.txt"; done; \
+    /opt/blurredbox-edge/venv/bin/python -m pip install --quiet --no-index --find-links /kit/wheelhouse \
+        $REQS blurredbox-agd /kit/blurredbox_edge_agent-*.whl; \
+    /opt/blurredbox-edge/venv/bin/python -m edge_agent --help >/dev/null; \
+    for x in $EXTRAS; do case "$x" in \
+        postgres) mods="psycopg2 psycopg2.extras" ;; parquet) mods="pyarrow pyarrow.parquet" ;; \
+        kafka) mods="confluent_kafka fastavro" ;; *) echo "unknown input $x" >&2; exit 1 ;; esac; \
+      for m in $mods; do /opt/blurredbox-edge/venv/bin/python -c "import $m" || { echo "input $x: $m does not import" >&2; exit 1; }; done; \
+    done; \
+    echo "$EXTRAS" > /opt/blurredbox-edge/INPUTS; \
+    /opt/blurredbox-edge/venv/bin/python -m pip uninstall --quiet --yes pip; \
+    /opt/blurredbox-edge/venv/bin/python -c "import importlib.metadata as m; print(m.version('blurredbox-edge-agent'))" \
+        > /opt/blurredbox-edge/VERSION
+COPY entrypoint.py /opt/blurredbox-edge/entrypoint.py
+# the kit's pairing tool (scripts/partner_pair.py), where the Linux installer puts it; `pair` runs it
+COPY partner_pair.py /opt/blurredbox-edge/lib/partner_pair.py
+COPY assemble_rootfs.sh /usr/local/sbin/assemble_rootfs.sh
+RUN sh /usr/local/sbin/assemble_rootfs.sh /rootfs
+
+FROM scratch
+ARG BASE_IMAGE
+ARG VERSION=unknown
+ARG EXTRAS=""
+COPY --from=build /rootfs/ /
+ENV PATH=/opt/blurredbox-edge/venv/bin:/usr/local/bin \
+    LANG=C.UTF-8 \
+    HOME=/tmp \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2
+USER 10001:10001
+WORKDIR /var/lib/blurredbox-edge
+VOLUME ["/var/lib/blurredbox-edge"]
+# SIGTERM sends what is queued and keeps the open window in the state volume for the next start (as in the unit).
+STOPSIGNAL SIGTERM
+# `--check` (exec form, no shell): healthy while the source check says SOURCE_COMPATIBLE or CAUGHT_UP (a quiet source).
+HEALTHCHECK --interval=5m --timeout=60s --start-period=2m --retries=3 \
+    CMD ["/opt/blurredbox-edge/venv/bin/python", "/opt/blurredbox-edge/entrypoint.py", "--check"]
+ENTRYPOINT ["/opt/blurredbox-edge/venv/bin/python", "/opt/blurredbox-edge/entrypoint.py"]
+CMD []
+LABEL org.opencontainers.image.title="BlurredBox edge agent" \
+      org.opencontainers.image.description="Computes per-window summary statistics locally and sends only those, outbound HTTPS only" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.vendor="BlurredBox" \
+      org.opencontainers.image.licenses="Proprietary" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}" \
+      com.blurredbox.edge.inputs="${EXTRAS}"

@@ -1,13 +1,13 @@
 """
 corpus/quality.py
 
-Deterministic data-quality rules, plus the novelty score.
+Phase 3 Task 6's deterministic data-quality rules, plus Task 5's novelty score.
 
 These are RULES, not estimators -- they catch pipeline failures, not
 distributional ones, and the tolerance for a false negative on a broken
 pipeline is far lower than on a drift statistic.
 
-*** THEY GATE THE STATISTICAL FIELDS ***
+*** THEY GATE THE REST OF THE PHASE ***
 
 A PSI computed over a window with silent dtype corruption is not a wrong
 number, it is a meaningless one that LOOKS LIKE DRIFT. So a structural failure
@@ -15,7 +15,7 @@ number, it is a meaningless one that LOOKS LIKE DRIFT. So a structural failure
 window rather than letting them be computed on corrupt input.
 
 Without that gate, the first symptom of a broken pipeline is a drift alert, and
-attribution points at the wrong thing -- the specific harm the attribution rule exists to
+attribution points at the wrong thing -- the specific harm I-4 exists to
 prevent.
 """
 from __future__ import annotations
@@ -27,9 +27,9 @@ from typing import Any, Sequence
 __all__ = ["QualityReport", "check_window", "novelty_score",
            "MIN_CATEGORY_COUNT", "STRUCTURAL_CHECKS"]
 
-# The non-content guarantee: a category appearing fewer than this
+# Phase 1 Task 6's non-content guarantee: a category appearing fewer than this
 # many times can reveal a single record. Suppression costs real early
-# schema-break sensitivity -- accepted because the non-content guarantee outranks it.
+# schema-break sensitivity -- accepted because I-1 outranks it.
 MIN_CATEGORY_COUNT = 5
 
 STRUCTURAL_CHECKS = ("schema_valid", "dtype_conformant", "train_serve_parity")
@@ -101,7 +101,7 @@ def check_window(rows: Sequence[dict], *,
     miss = {c: sum(1 for r in rows if r.get(c) is None) / n for c in cols}
     rep.fields["missingness_rate"] = miss
     if reference_missingness:
-        # Rule: "> 2x reference rate, or > 0.5 absolute". An earlier
+        # Task 6 §4: "> 2x reference rate, or > 0.5 absolute". An earlier
         # version added a `ref + 0.04` floor to damp spikes at tiny reference
         # rates -- which blocked exactly the case the spec uses as its example
         # (1% -> 5% is a broken upstream join even though 5% sounds small).
@@ -145,7 +145,7 @@ def check_window(rows: Sequence[dict], *,
             for v in vals:
                 if v not in known:
                     counts[v] = counts.get(v, 0) + 1
-            # The non-content guarantee's "minimum-count suppression":
+            # `phase-01-non-content-guarantee.md` s"minimum-count suppression":
             # below MIN_CATEGORY_COUNT occurrences the category emits no
             # PER-CATEGORY signal, but its volume is "folded into an aggregate
             # below-threshold new-category count contribution to the window's
@@ -156,7 +156,7 @@ def check_window(rows: Sequence[dict], *,
             # which is a different guarantee from the one the contract makes:
             # it hides that new-category mass occurred at all, and it made this
             # module disagree with `harness.py`'s rate on the same window --
-            # the corpus-versus-wire divergence that is the design's
+            # the corpus-versus-wire divergence Phase 2 s3 calls the plan's
             # most likely silent failure. What the threshold protects is the
             # ability to point at WHICH category, and no per-category value is
             # emitted here at any count.
@@ -190,7 +190,7 @@ def check_window(rows: Sequence[dict], *,
 
 def novelty_score(mahalanobis: float, reference_median: float,
                   pca_ratio: float) -> float:
-    """The distance proxy -- the default estimator, zero marginal cost.
+    """Task 5's distance proxy -- the default estimator, zero marginal cost.
 
     `max` of the two normalised components rather than a mean: they catch
     different novelty. Mahalanobis sees distance ALONG known correlation

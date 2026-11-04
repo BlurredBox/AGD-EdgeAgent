@@ -33,15 +33,16 @@ def _spool(root: Path, now: float) -> dict[str, Any]:
     models: dict[str, Any] = {}
     total = 0
     if root.is_dir():
-        for d in sorted(p for p in root.iterdir() if p.is_dir() and p.name != "rejected"):
+        for d in sorted(p for p in root.iterdir() if p.is_dir() and p.name not in ("rejected", "replayed")):
             files = sorted(d.glob("*.json"))
             total += len(files)
             oldest = min((f.stat().st_mtime for f in files), default=None)
             models[d.name] = {"queued": len(files),
                               "oldest_age_seconds": None if oldest is None else max(0.0, now - oldest)}
-    rejected = root / "rejected"
+    rejected, replayed = root / "rejected", root / "replayed"
     return {"queued": total, "models": models,
-            "rejected": len(list(rejected.glob("*.json"))) if rejected.is_dir() else 0}
+            "rejected": len(list(rejected.glob("*.json"))) if rejected.is_dir() else 0,
+            "replayed": len(list(replayed.glob("*.json"))) if replayed.is_dir() else 0}
 
 
 def _outcome_rows(path: Path) -> int | None:
@@ -55,6 +56,31 @@ def _outcome_rows(path: Path) -> int | None:
             db.close()
     except sqlite3.Error:
         return None
+
+
+def _sources(root: Path) -> list[dict[str, Any]]:
+    """Committed position of each table/folder adapter: counts and times only (no row ids,
+    file names or values). `lag` and delivery counters live in the agent snapshot."""
+    out = []
+    d = root / "sources"
+    for f in sorted(d.glob("*.json")) if d.is_dir() else []:
+        st = _read_json(f)
+        if not isinstance(st, dict):
+            continue
+        entry: dict[str, Any] = {"name": f.stem, "type": st.get("type"),
+                                 "state_age_seconds": max(0.0, time.time() - f.stat().st_mtime)}
+        if st.get("type") == "postgres":
+            pos = st.get("position")
+            entry["committed_ts"] = None if not pos else (pos["ts"] or {}).get("v")
+        elif st.get("type") == "folder":
+            files = st.get("files", {})
+            entry.update(files_tracked=len(files), files_done=sum(1 for v in files.values() if v.get("done")))
+        elif st.get("type") == "kafka":
+            entry["partitions_committed"] = len(st.get("committed") or {})
+        out.append(entry)
+    for f in sorted(d.glob("*.offset")) if d.is_dir() else []:
+        out.append({"name": f.stem, "type": "jsonl", "offset": _offset(f)})
+    return out
 
 
 def _alerts(path: Path) -> dict[str, Any]:
@@ -87,6 +113,7 @@ def read_status(state_dir: str | Path, *, now: float | None = None) -> dict[str,
         "agent_snapshot_age_seconds": None if written is None else max(0.0, now - written),
         "spool": _spool(root / "spool", now),
         "offsets": {"source": _offset(root / "source.offset"), "outcome": _offset(root / "outcome.offset")},
+        "sources": _sources(root),
         "outcome_join_rows_retained": _outcome_rows(root / "outcomes.sqlite"),
         "local_alerts": _alerts(root / "alerts.jsonl"),
         "note": "read-only local report; counts and dispositions only",

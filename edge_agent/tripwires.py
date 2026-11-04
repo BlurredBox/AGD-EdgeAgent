@@ -22,6 +22,7 @@ FEED_DOWN, FEED_RECOVERED = "feed_down", "feed_recovered"
 SCHEMA_BREAK, HARD_CONSTRAINT = "schema_break", "hard_constraint"
 LINK_DOWN, LINK_RECOVERED = "link_down", "link_recovered"
 REJECTED = "window_rejected"
+LABELS_MISSING, LABELS_RECOVERED = "labels_missing", "labels_recovered"
 
 
 @dataclass

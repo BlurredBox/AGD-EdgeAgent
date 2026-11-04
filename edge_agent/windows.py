@@ -34,6 +34,10 @@ class WindowCutter:
         self._closed_upto = -1            # highest bucket already emitted
         self.late_dropped = 0
 
+    def earliest_open_start(self) -> datetime | None:
+        """Start of the oldest window still holding records (None: nothing is waiting)."""
+        return self.bounds(min(self._open))[0] if self._open else None
+
     def bucket(self, ts: datetime) -> int:
         return int(ts.timestamp() // self.cadence)
 
@@ -57,6 +61,24 @@ class WindowCutter:
 
     def flush(self) -> list[ClosedWindow]:
         return self._close(lambda b: True)
+
+    def open_buckets(self) -> list[int]:
+        return sorted(self._open)
+
+    def open_windows(self) -> dict[int, list[Record]]:
+        """The windows still open (bucket -> its records), for keeping them over a stop."""
+        return {b: list(recs) for b, recs in sorted(self._open.items())}
+
+    def restore(self, records: list[Record]) -> int:
+        """Put records kept over a stop back into their (still open) windows, without closing any.
+        A record whose window this cutter has already closed is not restored. Returns how many were."""
+        n = 0
+        for rec in records:
+            b = self.bucket(rec.ts)
+            if b > self._closed_upto:
+                self._open.setdefault(b, []).append(rec)
+                n += 1
+        return n
 
     def _close(self, pred) -> list[ClosedWindow]:
         out = []

@@ -1,36 +1,36 @@
 """
 corpus/forecaster.py
 
-The failure forecaster -- stage 1 (gradient-boosted trees).
+Phase 5's failure forecaster -- `ladder-v1` stage 1.
 
-This is the thing every other component exists to make possible: a model that,
-given a window of the signal vector, says how likely the monitored model
+This is the thing every earlier phase exists to make possible: a model that,
+given a window of Phase 1's signal vector, says how likely the monitored model
 is to breach its service objective within each horizon.
 
-Four design decisions are implemented here:
+Four named decisions are implemented here, and none of them is re-litigated:
 
-  features       single-timestep input; the candidate pool is the operator
+  `fc-v1`        single-timestep input; the candidate pool is the operator
                  columns the corpus materialises PLUS the raw levels, so
-                 the detector-vs-predictor rule can actually fire;
+                 Task 1 s5's detector-vs-predictor rule can actually fire;
                  selection is GBT-importance RFE fitted INSIDE each training
                  fold, never once over the whole corpus.
-  ladder         gradient-boosted trees ship FIRST, standalone, fit
+  `ladder-v1`    gradient-boosted trees ship FIRST, standalone, fit
                  per-horizon-bucket so a single model family produces
                  hazard-per-horizon rather than one boolean. The survival head
-                 is stage 2 and is gated on offline evaluation.
-  loss           the optimisation target is **partial AUROC at low FPR**
+                 is stage 2 and is gated on Phase 10.
+  `loss-v1`      the optimisation target is **partial AUROC at low FPR**
                  (FPR in [0, 0.1]), not full AUROC -- alert fatigue kills the
                  product before accuracy does. Training uses class-balanced
                  pair sampling concentrated on the low-FPR band
                  (`pauc_pair_weights`); see its docstring for what that is
                  and, importantly, what it is not.
-  horizons       the output object is hazard per horizon, a survival curve,
+  `horizons-v1`  the output object is hazard per horizon, a survival curve,
                  expected time to breach with a confidence interval, an
                  attribution payload, and `warmup_state`.
 
 **What this deliberately does not do.** It does not judge whether the model is
-good enough -- that is the evaluation protocol's job. It reports partial
-AUROC because the loss decision names it as the target, not as a claim of adequacy.
+good enough -- that is Phase 10, against its own protocol. It reports partial
+AUROC because `loss-v1` names it as the target, not as a claim of adequacy.
 """
 from __future__ import annotations
 
@@ -59,32 +59,32 @@ __all__ = [
     "partial_auroc",
 ]
 
-# The horizon set, in WINDOWS. The corpus is nominal-time (synthetic
-# timestamps), so horizons are expressed in windows rather than hours -- a window is
+# horizons-v1's horizon set, in WINDOWS. The corpus is nominal-time (Phase 2
+# s5), so horizons are expressed in windows rather than hours -- a window is
 # the unit the harness actually emits and the only one that means the same
 # thing across HMDA's 5-minute and turbofan's 15-minute cadence.
 #
 # **The ceiling is the pre-onset runway, not the episode length.** Injections
-# fire at `ONSET_WINDOW = 60` (corpus build), and `windows_to_event` is only
+# fire at `ONSET_WINDOW = 60` (build_corpus.py), and `windows_to_event` is only
 # defined for windows at or before the onset, so no label exists for a horizon
 # beyond 60 windows however long the episode runs. 48 is the largest horizon
 # that leaves usable runway in front of it.
 #
-# Against the committed horizon sets, at the 5-minute default cadence:
+# Against `horizons-v1` s3's committed sets, at Phase 1 s6's 5-minute default:
 #
 #   trading   15 min / 1h / 4h  ->  3 / 12 / 48 windows   ALL deliverable
 #   credit    24h / 7d / 30d    ->  288 / 2016 / 8640     NONE deliverable
 #
 # The credit family was re-scoped rather than left as an unbacked promise
-# (2026-08-14). Reaching 24h needs a corpus whose runway is ~5x
-# longer, which is corpus-build work.
+# (Harutyun, 2026-08-14). Reaching 24h needs a corpus whose runway is ~5x
+# longer, which is Phase 2 work and is recorded as a handoff there.
 HORIZONS = (1, 3, 6, 12, 24, 48)
 
 # The uninjected arm's injection label. Canonical HERE because three modules
-# need it and none of them may import each other: the corpus builder
-# WRITES it, the trainer must HOLD IT OUT of fitting, and
-# the evaluator scores against it for sim-to-real. It previously
-# existed as two independent literals in the builder and the evaluator, which is
+# need it and none of them may import each other: scripts/build_corpus.py
+# WRITES it, scripts/train_forecaster.py must HOLD IT OUT of fitting, and
+# corpus/evaluation.py scores against it for sim-to-real. It previously
+# existed as two independent literals in build_corpus and evaluation, which is
 # how the trainer ended up fitting on the arm reserved to validate it.
 CONTROL_ARM = "none"
 
@@ -92,7 +92,7 @@ CONTROL_ARM = "none"
 def load_episodes(corpus: "Path") -> dict:
     """Episode provenance, keyed by episode_id.
 
-    Only USABLE episodes are here -- the corpus builder writes `episodes.jsonl`
+    Only USABLE episodes are here -- `build_corpus` writes `episodes.jsonl`
     from the usable set while writing window rows for every job that ran, so
     `SPONTANEOUS_PRE_ONSET` episodes (the base model was already breaching
     before injection) have rows and no provenance. The caller filters on this
@@ -114,7 +114,7 @@ def load_episodes(corpus: "Path") -> dict:
         e = json.loads(line)
         # ONLY a failed episode has an onset. `time_to_event` is overloaded:
         # windows-to-onset when `event = 1`, windows-to-stream-end when the
-        # episode was censored (per the label definition). Reading
+        # episode was censored (`phase-02-label-definition.md` §6). Reading
         # the second as an onset invents a breach and hands the reactive
         # baseline a ~19-hour lead on an episode where nothing failed.
         e["onset_index"] = (e.get("time_to_event")
@@ -123,7 +123,7 @@ def load_episodes(corpus: "Path") -> dict:
     return out
 
 
-# Loss: the band the target is computed over, and the same band the
+# loss-v1: the band the target is computed over, and the same band Phase 10's
 # promotion gate uses.
 FPR_MAX = 0.1
 
@@ -137,19 +137,19 @@ FPR_MAX = 0.1
 # read 0.051, a perfect ranking reads 1.000, an inverted one reads 0.000.
 #
 # The claim mattered. Held-out folds scoring 0.2-0.5 look like failure against
-# a 0.5 chance line and like 4-10x chance against the real one, and the
+# a 0.5 chance line and like 4-10x chance against the real one, and Phase 10's
 # promotion gate reads exactly these numbers.
 CHANCE_PARTIAL_AUROC = FPR_MAX / 2
 
 
-# The field the LABEL is computed from. the labeller derives the
+# The field the LABEL is computed from. `corpus/labelling.py` derives the
 # breach threshold from the `true_metric` series, and `harness.py` copies that
 # same series into the signal vector as `realised_metric`, where
 # `trajectory.py` gives it all six operator derivatives.
 #
 # It is kept in the candidate pool -- at window t its value is known at time t,
 # so it predicts rather than leaks -- but it must be COUNTED SEPARATELY.
-# The feature-construction binding rule asks whether trajectory
+# `phase-05-feature-construction.md` s5's binding rule asks whether trajectory
 # operators or raw levels dominate, in order to answer "is this a predictor or
 # just a detector". Scoring `realised_metric__ewma` on the operator side lets
 # a model that does nothing but watch the target metric's own trajectory
@@ -165,7 +165,7 @@ LABEL_DEPENDENT_FIELDS = frozenset({"brier", "nll", "ece", "mce", "ci_width"})
 
 
 def classify_feature(name: str) -> str:
-    """Classify deployability and trajectory role for the detector-vs-predictor rule."""
+    """Classify deployability and trajectory role for s5's binding rule."""
     if name == TARGET_FIELD or name.startswith(TARGET_FIELD + "__"):
         return "target_derived"
     if base_field(name) in LABEL_DEPENDENT_FIELDS:
@@ -178,7 +178,7 @@ def partial_auroc(y_true, y_score, fpr_max: float = FPR_MAX) -> float:
 
     Full AUROC rewards ranking improvements in a region the product never
     operates in: nobody ships an alerting system at 60% false-positive rate.
-    The loss therefore optimises and reports the low-FPR region only.
+    `loss-v1` therefore optimises and reports the low-FPR region only.
 
     **Read this against `CHANCE_PARTIAL_AUROC`, not against 0.5.** Normalising
     by `fpr_max` puts a perfect ranking at 1.0 and a random one at
@@ -201,7 +201,7 @@ def partial_auroc(y_true, y_score, fpr_max: float = FPR_MAX) -> float:
     # distinct probabilities over 2,000 rows scored anywhere in 0.029-0.060
     # on the SAME data, purely by permuting row order -- straddling
     # CHANCE_PARTIAL_AUROC in both directions, which is exactly what
-    # the promotion gate counts folds against. The evaluator's `pr_auc`
+    # `p14gate-v1`'s M1 counts folds against. `corpus/evaluation.py::pr_auc`
     # already averaged ties for this reason; this is the same rule on the
     # metric the gate actually reads.
     order = np.argsort(-y_score, kind="mergesort")
@@ -262,8 +262,8 @@ class Forecast:
     interval from them. Only a censor-aware conditional-hazard head may emit
     those quantities.
 
-    The last three fields are the missing-telemetry wire shape. They were
-    specified in the design and existed in no code path
+    The last three fields are `missingtelemetry-v1`'s wire shape. They were
+    specified in `phase-05-missing-telemetry.md` and existed in no code path
     until 2026-08-14, which an independent review caught: the document
     described a degradation report the forecaster never emitted.
     """
@@ -274,20 +274,20 @@ class Forecast:
     attribution_payload: list[tuple[str, float]]
     warmup_state: str
     output_semantics: str = "cumulative_risk_within_horizon"
-    # Missing telemetry (1): which SELECTED fields were absent this window.
+    # missingtelemetry-v1 s1: which SELECTED fields were absent this window.
     # Absence degrades the forecast, it never fails it.
     fields_missing: list[str] = field(default_factory=list)
-    # Missing telemetry (2): fields present on the wire that this model does
+    # missingtelemetry-v1 s2: fields present on the wire that this model does
     # not consume. Reported so a customer who enables a wider domain profile
     # is not silently wrong about what the forecaster is using.
     fields_ignored: list[str] = field(default_factory=list)
-    # Missing telemetry (3): the performance estimator declined to estimate, and a forecast was
+    # missingtelemetry-v1 s3: Phase 4 declined to estimate, and a forecast was
     # issued anyway with a widened interval. Orthogonal to `warmup_state` --
     # a window can be `live` AND have a declined estimate, and the console
     # must be able to check both independently.
     estimate_declined_forecast_issued: bool = False
-    # The per-model refusal contract (
-    # "refused, not imputed"). Populated only when `predict` is called
+    # The per-model refusal contract (13-model-fixes-pilot-plan.md Week 1
+    # item 0: "refused, not imputed"). Populated only when `predict` is called
     # with `refuse_absent=True`, which the serving path does. A horizon one of
     # whose selected columns is ABSENT from the window is not scored at all --
     # its key is missing from `hazard` -- and is listed here with the absent
@@ -340,7 +340,7 @@ class ForecasterBundle:
     # Importances captured at fit time. HistGradientBoostingClassifier exposes
     # no feature_importances_ at all, so reading one off the model would make
     # _attribute return an empty payload on every window -- silently violating
-    # the rule that makes attribution mandatory on EVERY alert rather than on the
+    # I-4, which makes attribution mandatory on EVERY alert rather than on the
     # ones where it happens to be available.
     importances_by_horizon: dict[int, list[float]] = field(default_factory=dict)
     importances: list[float] = field(default_factory=list)
@@ -352,68 +352,68 @@ class ForecasterBundle:
                 refuse_absent: bool = False,
                  strict_attribution: bool = True,
                  attribute: bool = True) -> list[Forecast]:
-        """Score a matrix, returning one horizon output object per row.
+        """Score a matrix, returning one horizons-v1 output object per row.
 
         `X`'s columns are named by `feature_names` (defaulting to
         `self.features`). Each horizon's matrix is assembled from those names,
         never positionally.
 
-        `estimator_valid` and `aux_model_valid` are the performance estimator's two refusal
-        surfaces, read INDEPENDENTLY as the missing-telemetry rule
+        `estimator_valid` and `aux_model_valid` are Phase 4's two refusal
+        surfaces, read INDEPENDENTLY as `phase-05-missing-telemetry.md` s3
         requires -- the trigger is an OR of two separately-read fields, not
         one flag, and this method does not re-derive a decline condition of
         its own.
 
         `refuse_absent=True` is the per-model refusal contract
-        (a
+        (`ROADMAP/PHASE10/13-model-fixes-pilot-plan.md` Week 1 item 0: a
         required field the model does not have is "refused, not imputed").
         A horizon with ANY selected column absent from `feature_names` is
         not scored: it is left out of `Forecast.hazard` and named, with its
         absent columns, in `Forecast.horizons_refused`. Nothing is NaN-filled
         for an absent column. A column that is PRESENT with a null value is
-        a tier-2 null -- the estimator was fitted with
+        a tier-2 null (Phase 3 Task 7 s0) -- the estimator was fitted with
         exactly those NaNs and routes them natively -- so it is not refused.
         The window is never rejected: every horizon that can be scored is,
-        which keeps the missing-telemetry never-fail-closed rule.
+        which keeps `missingtelemetry-v1` s1's never-fail-closed rule.
 
         `strict_attribution=False` (the serving path): a window with no non-zero
         signal contribution is returned with `attribution_payload == []` instead of
         raising, so one unattributable window cannot abort a stream. The CALLER then
-        owns the attribution rule: it must not page a forecast whose payload is empty
+        owns I-4: it must not page a forecast whose payload is empty
         (`SignalPipeline.unattributable`). Default True keeps training/eval strict.
 
         `attribute=False` skips the attribution payload (left empty). Only for a caller that
         reads the hazards alone and never raises an alert from this forecast: the learned
-        detector's paired forecaster. Every alerting forecaster keeps the default (attribution is mandatory).
+        detector's paired forecaster. Every alerting forecaster keeps the default (I-4).
         """
         names = feature_names or self.features
         idx = {n: i for i, n in enumerate(names)}
 
         # Two rules meet here and they pull in opposite directions.
         #
-        # Missing-telemetry rule: a missing selected field must DEGRADE the
+        # `missingtelemetry-v1` s1: a missing selected field must DEGRADE the
         # forecast, never fail it -- "it never fails closed on missing fields".
         # An earlier version of this method raised on any absent column, which
-        # honoured the wrong-column fix below but broke that rule outright.
+        # honoured the S4 fix below but broke that rule outright.
         #
-        # The wrong-column fix: this once read `Xi = X[:, take] if len(take) ==
+        # The S4 fix: this once read `Xi = X[:, take] if len(take) ==
         # len(cols) else X`, silently scoring a horizon on whatever matrix was
         # passed. Every horizon selects exactly k_max columns, so the
         # substitute usually has the right WIDTH and sklearn accepts it -- the
         # model reads another horizon's features and returns a confident,
-        # meaningless hazard. An earlier change fixed that in the evaluation path,
+        # meaningless hazard. ab99cdf8 fixed that in the evaluation path,
         # where it had driven held-out scores below chance; it survived here,
         # in the SERVING path, where no held-out score exists to catch it.
         #
         # Both are satisfied by building each horizon's matrix BY NAME and
         # filling absent columns with NaN, which the estimator routes natively
-        # (the missing-telemetry rule's stated mechanism). Nothing is ever
+        # (missingtelemetry-v1 s1's stated mechanism). Nothing is ever
         # substituted positionally, so a wrong-column hazard remains
         # impossible, and a genuinely absent field degrades instead of raising.
         selected = {c for cols in self.features_by_horizon.values() for c in cols}
         fields_missing = sorted(c for c in selected if c not in idx)
         fields_ignored = sorted(n for n in names if n not in selected)
-        # An OR of two independently-read fields. Not one flag, and not
+        # s3: an OR of two independently-read fields. Not one flag, and not
         # re-derived here from anything else.
         declined = (not estimator_valid) or (not aux_model_valid)
 
@@ -481,12 +481,12 @@ class ForecasterBundle:
 
     def _attribute(self, row: np.ndarray, names: list[str], top: int = 5,
                    horizons: list[int] | None = None):
-        """Top contributing signals. Mandatory on every alert.
+        """Top contributing signals. Mandatory on every alert under I-4.
 
         Importance x value, which is a contribution proxy rather than a
-        Shapley value: it is cheap enough to run on every window, and the attribution rule
+        Shapley value: it is cheap enough to run on every window, and I-4
         requires attribution on EVERY alert rather than on the ones that
-        happen to be affordable. The alert layer owns presentation; this only
+        happen to be affordable. Phase 6 s6 owns presentation; this only
         produces the ranking.
 
         Attribution is computed PER HORIZON and merged, because each horizon
@@ -496,11 +496,11 @@ class ForecasterBundle:
         horizon's values -- so on a five-horizon bundle, four horizons' alerts
         were attributed with a different model's importances.
 
-        Scope, stated so it is not overclaimed: the attribution rule names four elements --
+        Scope, stated so it is not overclaimed: I-4 names four elements --
         first detector, top contributing signals, the concentrating
         segment/feature, and correlated deploy events. This produces the
-        SECOND. The rest is routed through
-        the alert layer; this method alone does not discharge the rule.
+        SECOND. `phase-05-horizons-outputs.md` s4 routes the rest through
+        Phase 6 s6; this method alone does not discharge I-4.
         """
         idx = {n: i for i, n in enumerate(names)}
         per_h = self.importances_by_horizon or (
@@ -508,8 +508,8 @@ class ForecasterBundle:
             else {})
         if not per_h:
             raise ValueError(
-                "forecaster has no importances, so it cannot attribute. Attribution "
-                "is mandatory on every alert -- refusing rather "
+                "forecaster has no importances, so it cannot attribute. I-4 "
+                "makes attribution mandatory on every alert -- refusing rather "
                 "than emitting an alert with an empty payload.")
 
         merged: dict[str, float] = {}
@@ -538,7 +538,7 @@ class ForecasterBundle:
             # anyway when the pool is thin.
             raise ValueError(
                 "no signal has a non-zero contribution for this window, so "
-                "the alert cannot be attributed. Attribution is "
+                "the alert cannot be attributed. I-4 makes attribution "
                 "mandatory on every alert -- refusing rather than emitting "
                 "an alert with an empty payload.")
         return out
@@ -547,14 +547,14 @@ class ForecasterBundle:
 def pauc_pair_weights(y, scores=None, *, fpr_max: float = FPR_MAX,
                       pairs_per_positive: int = 4, seed: int = 7,
                       band_share: float = 0.8):
-    """The loss design's class-balanced pair sampling, restricted to low FPR.
+    """`loss-v1` §1's class-balanced pair sampling, restricted to low FPR.
 
     Returns per-sample weights standing in for a sampled set of
     (positive, negative) comparison pairs.
 
     **What this is, stated precisely, because the document it implements was
     previously described as "confirmed as implemented" when nothing existed.**
-    The loss design specifies "a pairwise ranking surrogate restricted to the
+    `loss-v1` §1 specifies "a pairwise ranking surrogate restricted to the
     low-FPR region, with class-balanced pair sampling".
     `HistGradientBoostingClassifier` accepts `sample_weight` but **no custom
     objective**, so a literal differentiable pairwise loss is not reachable
@@ -567,11 +567,11 @@ def pauc_pair_weights(y, scores=None, *, fpr_max: float = FPR_MAX,
     drawn into one. That targets the same quantity — the ordering of
     positives against the negatives that matter — without pretending to be a
     gradient-level ranking objective. Anything stronger requires the
-    estimator swap, which is left as future work rather than smuggled in.
+    estimator swap, and that is recorded as a handoff rather than smuggled in.
 
-    Two properties the loss design asks for, both real here:
+    Two properties `loss-v1` §1 asks for, both real here:
 
-    `class-balanced` — at a base rate near 0.3% (measured on a corpus build),
+    `class-balanced` — at a base rate near 0.3% (measured on build7),
     uniformly drawn pairs are almost all negative-negative and carry no
     ranking signal at all. Every pair here is positive-versus-negative by
     construction, so no draw is wasted.
@@ -653,7 +653,7 @@ def drop_post_event_windows(df):
 
     Found by an independent review, 2026-08-14, and confirmed by repro.
 
-    The corpus builder writes `windows_to_event = onset - w` while `w <= onset`
+    `build_corpus.py` writes `windows_to_event = onset - w` while `w <= onset`
     and `None` afterwards, keeping `event = 1` on every row of a failed
     episode. `_horizon_labels` maps `None` to infinity, so every post-breach
     window becomes a NEGATIVE -- while carrying the most degraded telemetry in
@@ -685,8 +685,8 @@ def family_of(group_id: str) -> str:
 def exclude_families(df, families):
     """Drop whole base-model families from a window frame, at LOAD time.
 
-    Added 2026-09-22 for a corpus requalification. `k_max = G / 10` on the
-    fitting corpus, and `G` counts `dataset:family:variant` groups, so a
+    Added 2026-09-22 for the build12 requalification. `k_max = G / 10` on the
+    fitting corpus (D-42), and `G` counts `dataset:family:variant` groups, so a
     family that must not be counted has to leave the frame BEFORE `G` is
     measured -- every caller derives `g = df["group_id"].nunique()` and then
     `k_max_for(g)`, so filtering here recomputes both correctly and no caller
@@ -695,16 +695,16 @@ def exclude_families(df, families):
 
     **This exists for one narrowly legitimate move: withdrawing a family that
     FAILED its own pre-registered independence check.** Check 3 of
-    the family-separability check judges each added family against the
+    `scripts/check_family_separability.py` judges each added family against the
     most-agreeing pair among the five families every published `G` already
     counted, and a family above that ceiling raises `k_max` while adding no
-    generalisation evidence -- which is the loophole the `k_max` rule exists to close. A
+    generalisation evidence -- which is the loophole D-42 exists to close. A
     family that fails is not a valid group and removal is the prescribed
     remedy.
 
     **It is not a knob.** Removing families until the check passes is tuning,
     and it would void `k_max` exactly as surely as keeping an illegitimate
-    family would; the pre-registered kill criteria bar the
+    family would; `ROADMAP/PHASE10/06-kill-criteria.md:41` bars the
     corpus-version treadmill it leads to. Every caller defaults to OFF, so
     every existing path stays byte-reproducible, and every caller records the
     exclusion in its report so a filtered run cannot be mistaken for the full
@@ -789,21 +789,21 @@ def fit_forecaster(df, *, k_max: int, horizons=HORIZONS,
                    include_label_dependent_fields: bool = True,
                    max_per_base_field: int | None = None,
                    benign_disturbance=None) -> ForecasterBundle:
-    """Fit forecaster stage 1 on a window-level corpus.
+    """Fit `ladder-v1` stage 1 on a window-level corpus.
 
     `df` is the Parquet corpus: one row per window, operator columns plus
-    survival fields. `k_max` comes from the MEASURED group count, never
+    survival fields. `k_max` comes from the MEASURED group count (D-42), never
     from a target -- selecting more features than the group count supports is
     the loophole `k_max` exists to close.
     """
     from sklearn.ensemble import HistGradientBoostingClassifier
 
-    # The candidate pool: operator-derived columns AND raw levels.
+    # fc-v1's candidate pool: operator-derived columns AND raw levels.
     #
     # Levels were excluded until 2026-08-14, and that quietly voided the one
-    # question the feature-construction rule exists to answer. Its
+    # question `phase-05-feature-construction.md` s5 exists to answer. Its
     # binding rule says that if selection is dominated by raw levels with few
-    # trajectory operators surviving, that is an evaluation finding about the
+    # trajectory operators surviving, that is a Phase 10 finding about the
     # product -- "this is a detector, not a predictor". With levels absent
     # from the pool, operators won 100% of slots BY CONSTRUCTION, and
     # reporting that as evidence would have been a tautology dressed as a
@@ -822,14 +822,14 @@ def fit_forecaster(df, *, k_max: int, horizons=HORIZONS,
                 "window_index", "event", "windows_to_event", "true_metric",
                 "warmup_state"}
 
-    # Non-content guard. An independent review observed that identifiers stayed out of
+    # I-1 guard. An independent review observed that identifiers stayed out of
     # the pool only by two accidents: the names above happen to be listed, and
     # the numeric-dtype filter happens to drop strings. A NUMERIC tenant or
     # install id added to the corpus would enter the candidate pool silently
     # and become a selectable feature -- which is a customer identifier
-    # crossing the boundary, the exact thing the non-content rule forbids.
+    # crossing the boundary, the exact thing I-1 forbids.
     #
-    # The signal-vector contract owns the boundary and should never emit such a column. This is
+    # Phase 1 owns the boundary and should never emit such a column. This is
     # the second line, and it refuses loudly rather than filtering quietly:
     # a corpus carrying one is a corpus with a provenance problem, and
     # dropping the column would hide it.
@@ -839,16 +839,16 @@ def fit_forecaster(df, *, k_max: int, horizons=HORIZONS,
                                                "client", "install", "user_id"))]
     if banned:
         raise ValueError(
-            f"candidate columns look like customer identifiers: {banned}. "
+            f"I-1: candidate columns look like customer identifiers: {banned}. "
             f"No customer identifier may cross the boundary into training. "
             f"Refusing rather than dropping them -- their presence means the "
-            f"corpus build emitted something it should have withheld.")
+            f"corpus build emitted something Phase 1 should have withheld.")
     # Dtype detection has to be robust, not `np.issubdtype`.
     #
     # Widening the pool to raw levels exposed this: `np.issubdtype` raises
     # TypeError on pandas extension dtypes (`StringDtype`), and it never saw
     # one while the pool was `"__" in c`, because operator columns are always
-    # numeric. One corpus build also carries 25 columns of `object` dtype -- operator
+    # numeric. build7 also carries 25 columns of `object` dtype -- operator
     # columns that are all-null for every dataset in a given Parquet file, so
     # pyarrow could not infer a numeric type for them.
     #
@@ -874,12 +874,12 @@ def fit_forecaster(df, *, k_max: int, horizons=HORIZONS,
         # `realised_metric` is the series the breach label is thresholded
         # from. At window t its value is known at time t, so it predicts
         # rather than leaks -- but production usually cannot supply it on
-        # time. Performance estimation exists *because* labels lag, and
-        # the field contract defines this field as null+flag until labels
+        # time. Phase 4 exists *because* labels lag, and
+        # `phase-01-fields.md` defines this field as null+flag until labels
         # land. A model leaning on it assumes a fidelity the deployment will
         # not have, and would degrade silently rather than loudly.
         #
-        # The ablation the independent review asked for was run on a corpus build and
+        # The ablation the independent review asked for was run on build7 and
         # settled it. Excluding these fields is free or better:
         #
         #   cross-config   0.690 with  ->  0.722 without
@@ -906,7 +906,7 @@ def fit_forecaster(df, *, k_max: int, horizons=HORIZONS,
     #
     # These were invisible while NaN was being zero-imputed: an all-null
     # column became an all-zero column, which is still one distinct value, but
-    # the widened pool plus that build's 25 object-dtype all-null operator columns
+    # the widened pool plus build7's 25 object-dtype all-null operator columns
     # is what first drove a fold to have nothing else to bin. Dropping them is
     # not a workaround -- a constant feature is genuinely not a candidate.
     keep = df[numeric].nunique(dropna=True) >= 2
@@ -920,12 +920,12 @@ def fit_forecaster(df, *, k_max: int, horizons=HORIZONS,
     if not operators:
         raise ValueError(
             "no operator columns in the corpus. The build must run "
-            "trajectory.merge_into_z -- without it the forecaster has "
-            "nothing to select over.")
+            "trajectory.merge_into_z -- without it fc-v1 has nothing to "
+            "select over.")
 
     # NaN is passed through to the estimator, NOT imputed.
     #
-    # The missing-telemetry rule requires "native missing-value routing (NaN-
+    # `missingtelemetry-v1` s1 requires "native missing-value routing (NaN-
     # aware split decisions) rather than a learned or heuristic imputer", and
     # argues the point at length: a second, separately-validated imputation
     # mechanism is a liability. This line used to read
@@ -953,7 +953,7 @@ def fit_forecaster(df, *, k_max: int, horizons=HORIZONS,
     metrics: dict[str, Any] = {
         "horizons": {}, "n_windows": len(df),
         "pool_size": len(numeric), "k_max": k_max,
-        # Reported so the operator-vs-level question has a denominator. A
+        # Reported so s5's operator-vs-level question has a denominator. A
         # survival count means nothing without knowing how many of each were
         # available to be chosen. Three-way, not two -- see TARGET_FIELD.
         "pool_operators": kinds.count("operator"),
@@ -986,7 +986,7 @@ def fit_forecaster(df, *, k_max: int, horizons=HORIZONS,
 
         # Selection is fitted on THIS horizon's training data only. Doing it
         # once over the whole corpus would make k_max bound nothing, which is
-        # the exact failure the width-ratio rule makes
+        # the exact failure phase-01-02-width-ratio-reconciliation s3.3 makes
         # a hard requirement rather than guidance.
         # Experimental actionability arm changes feature SELECTION only.
         # Final pair-sampled fit and probability target remain unchanged.
@@ -1012,14 +1012,14 @@ def fit_forecaster(df, *, k_max: int, horizons=HORIZONS,
             keep = order[:k_max]
         else:
             # Redundancy control, pre-registered in
-            # a selection experiment. Walk the
+            # `docs/measurements/phase-10-h12-selection-experiment.md`. Walk the
             # SAME importance ranking and skip a candidate once its base field
             # has taken its quota. Not a field exclusion list: the rule names no
             # field, applies at every horizon and fold, and the higher-importance
             # member of a family always keeps the slot.
             #
             # Default is None so the qualified artifact
-            # stays byte-reproducible. Changing that default is a
+            # 21abffc5...9cb1 stays byte-reproducible. Changing that default is a
             # decision about the product, not a tidy-up.
             taken: dict[str, int] = {}
             picked: list[int] = []
@@ -1049,7 +1049,7 @@ def fit_forecaster(df, *, k_max: int, horizons=HORIZONS,
         feats_by_h[h] = cols
         imps_by_h[h] = selected_importances
 
-        # Loss pair sampling, in two rounds.
+        # loss-v1 s1, in two rounds.
         #
         # Round 1 draws class-balanced positive-versus-negative pairs, which
         # is the part that does not need scores. Round 2 re-draws them
@@ -1077,7 +1077,7 @@ def fit_forecaster(df, *, k_max: int, horizons=HORIZONS,
             "base_rate": float(y.mean()),
             "partial_auroc_low_fpr": partial_auroc(y, p),
             "features": cols,
-            # The detector-vs-predictor rule is evaluated per horizon, not just overall:
+            # s5's binding rule is evaluated per horizon, not just overall:
             # operators may win at short horizons and lose at long ones, and
             # that difference IS the detector-vs-predictor answer.
             "operators_selected": k.count("operator"),

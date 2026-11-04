@@ -1,5 +1,5 @@
 """
-edge_agent -- the partner-side producer of `z_t`.
+edge_agent -- the partner-side producer of `z_t` (gap G1).
 
 Runs on the PARTNER's infrastructure. It observes the monitored model's
 inputs and outputs locally, pulls PUBLIC market prices itself, computes the
@@ -17,7 +17,17 @@ Data flow
         -> wire.build_envelope (flatten_z_t, id re-keying, allow-list audit)
         -> DurableSpool -> Sender (SDK IngestTransport, HMAC-signed)
 """
-from edge_agent.agent import EdgeAgent
+import os
+
+# Math-library threads capped at 2 before numpy/sklearn load (G60): the domain classifier gives the same output and
+# runs 15-60x faster under a CPU limit (docs/measurements/edge-classifier-cost-2026-10-29.md). Here, in the package
+# init, it precedes every edge entry point (`python -m edge_agent`, `blurredbox-edge-replay`, the scripts that import
+# the package). Defaults only: a value already in the environment (agent.env, the shell) wins.
+THREAD_CAP_DEFAULTS = {"OMP_NUM_THREADS": "2", "OPENBLAS_NUM_THREADS": "2", "MKL_NUM_THREADS": "2"}
+for _name, _value in THREAD_CAP_DEFAULTS.items():
+    os.environ.setdefault(_name, _value)
+
+from edge_agent.agent import EdgeAgent  # noqa: E402
 from edge_agent.config import EdgeConfig
 from edge_agent.records import Record
 

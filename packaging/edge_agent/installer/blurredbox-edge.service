@@ -1,0 +1,53 @@
+[Unit]
+Description=BlurredBox edge agent
+Documentation=file:///usr/share/doc/blurredbox-edge/EDGE_AGENT_INSTALL.md
+After=network-online.target
+Wants=network-online.target
+# Never start an unconfigured install (setup writes agent.env last, before the first start).
+ConditionPathExists=/etc/blurredbox-edge/config.json
+ConditionPathExists=/etc/blurredbox-edge/agent.env
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User=blurredbox-edge
+Group=blurredbox-edge
+# Math-library threads capped at 2 (G60): same output, 15-60x faster under a CPU quota; agent.env may override.
+# See docs/measurements/edge-classifier-cost-2026-10-29.md.
+Environment=OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2
+EnvironmentFile=/etc/blurredbox-edge/agent.env
+WorkingDirectory=/var/lib/blurredbox-edge
+ExecStart=/opt/blurredbox-edge/venv/bin/python -m edge_agent --config /etc/blurredbox-edge/config.json
+# SIGTERM: the agent sends what is queued and keeps the window still open (with its rows) in the state; the next
+# start sends it once, at its real end (a window closed early is refused by the server).
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the only writable place is the state directory; the code and the config are read-only to the service.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/blurredbox-edge
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
