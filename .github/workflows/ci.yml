@@ -1,0 +1,44 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.15.12
+      - run: ruff check edge_agent tests
+      - run: ruff check --select F401,F841 corpus
+      - run: python -m compileall -q edge_agent corpus tests scripts
+      - name: Leak check
+        env:
+          EDGE_LEAK_PATTERNS: ${{ secrets.EDGE_LEAK_PATTERNS }}
+        run: python scripts/release_from_agd.py --check-leaks
+  tests:
+    # The agent imports the BlurredBox SDK (`blurredbox_agd`), which is not on a public index. If the repository secret
+    # AGD_SDK_PIP_URL (a complete pip requirement for the SDK, set by a maintainer) exists, the full suite runs; without
+    # it (forks, pull requests from forks) the tests skip via tests/edge_agent/conftest.py and this job only shows that.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        env:
+          SDK_PIP_URL: ${{ secrets.AGD_SDK_PIP_URL }}
+        run: |
+          pip install -r requirements-edge.txt -r packaging/edge_agent/requirements-edge-parquet.txt "pytest>=8"
+          if [ -n "$SDK_PIP_URL" ]; then
+            pip install "$SDK_PIP_URL"
+          else
+            echo "SDK not available: the suite will skip" >&2
+          fi
+      - run: python -m pytest -q -ra
