@@ -1,16 +1,16 @@
 """
 corpus/sketches.py
 
-The two streaming sketches fixed for the wire contract:
+The two streaming sketches Phase 1 Task 5 fixed for the wire contract:
 
   * t-digest, compression delta = 100, ~4 KB worst case  -- continuous fields
   * HyperLogLog, precision p = 14 (16,384 registers), 12 KB dense -- categoricals
 
 These close the two fixtures the shared conformance runner leaves as stubs
-(`sketch_tdigest_accuracy`, `sketch_hll_cardinality`).
-This module closes them.
+(`sketch_tdigest_accuracy`, `sketch_hll_cardinality`). Phase 2 Task 4 requires
+them closed or routed back to Phase 1 with a reason; this closes them.
 
-They matter beyond accuracy: the non-content guarantee argues that a
+They matter beyond accuracy: Phase 1's non-content guarantee argues that a
 sketch transmits distributional *shape* and not recoverable individual values.
 That argument is only true of a specific structure at a specific resolution,
 so the structure has to exist and be tested rather than assumed.
@@ -28,7 +28,7 @@ class TDigest:
     """Merging t-digest.
 
     Centroid density scales with 1/(q(1-q)), so accuracy concentrates at the
-    tails -- which is what the contract wants for p95/p99 drift on score
+    tails -- which is what Phase 1 wanted for p95/p99 drift on score
     distributions, where the interesting movement is in the tail rather than
     the middle.
 
@@ -93,7 +93,7 @@ class TDigest:
 
         The 4*q(1-q) term is what concentrates resolution at the tails: near
         q=0.5 a centroid may absorb ~2% of total weight at delta=100, near the
-        tails only ~1%. That asymmetry is the reason t-digest was chosen
+        tails only ~1%. That asymmetry is the reason Phase 1 chose t-digest
         over KLL -- p95/p99 drift on score distributions is where the
         interesting movement is.
         """
@@ -137,7 +137,7 @@ class TDigest:
         return cs[-1][0]
 
     def serialized_size_bytes(self) -> int:
-        """Two float64 per centroid. The number bandwidth is sized from."""
+        """Two float64 per centroid. The number Task 8 sizes bandwidth from."""
         self._flush()
         return len(self._centroids) * 16
 
@@ -148,7 +148,7 @@ class TDigest:
 class HyperLogLog:
     """HyperLogLog cardinality sketch with linear-counting small-range correction.
 
-    The correction is not optional here. The contract uses this for
+    The correction is not optional here. Phase 1 uses this for
     `cardinality_change` and `new_category_rate`, and real categorical
     features routinely have tens of distinct values -- exactly the range where
     raw HLL is badly biased and linear counting is accurate.
@@ -205,7 +205,7 @@ class HyperLogLog:
         return int(round(raw))
 
     def serialized_size_bytes(self) -> int:
-        """Dense encoding at 6 bits/register -- 12 KB at p=14, the contract's number."""
+        """Dense encoding at 6 bits/register -- 12 KB at p=14, Phase 1's number."""
         return math.ceil(self.m * 6 / 8)
 
     def standard_error(self) -> float:

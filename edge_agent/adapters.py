@@ -10,15 +10,31 @@ import os
 import queue
 from abc import ABC, abstractmethod
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Callable, Iterable
 
 from edge_agent.records import Record
+
+
+class Sample:
+    """A bounded look at a source for `--check`: nothing is staged, persisted or sent."""
+    def __init__(self, records: list[Record], bad: int) -> None:
+        self.records, self.bad = records, bad
 
 
 class SourceAdapter(ABC):
     @abstractmethod
     def poll(self, max_records: int = 10_000) -> list[Record]:
         """Return the records that arrived since the last call (maybe none)."""
+
+    def commit(self, before: "datetime | None" = None) -> None:
+        """The agent has durably consumed every delivered record with `ts < before`
+        (all of them when `before` is None). Adapters that checkpoint on commit
+        override this; the tail/in-process adapters checkpoint on poll and ignore it."""
+
+    def describe(self) -> dict:
+        """Counts-only description for `--status` (no row values, ids or file names)."""
+        return {}
 
 
 class InProcessAdapter(SourceAdapter):
@@ -108,6 +124,32 @@ class JsonlTailAdapter(SourceAdapter):
                     self.bad_lines += 1
         self._save_offset()
         return out
+
+    def describe(self) -> dict:
+        return {"type": "jsonl", "offset": self._offset, "bad_lines": self.bad_lines}
+
+    def sample(self, limit: int = 1000) -> Sample:
+        """Parse up to `limit` non-blank lines from the start of the file; no offset is written."""
+        recs: list[Record] = []
+        rows = bad = 0
+        with open(self.path, encoding="utf-8") as source:
+            for line in source:
+                if not line.strip():
+                    continue
+                rows += 1
+                try:
+                    d = json.loads(line)
+                    if self.parse:
+                        d = self.parse(d)
+                    recs.append(Record.make(d["ts"], d["model_id"], d["instrument"], d["features"],
+                                            d["output"], prediction_id=d.get("prediction_id"),
+                                            outcome=d.get("outcome"),
+                                            outcome_observed_at=d.get("outcome_observed_at")))
+                except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
+                    bad += 1
+                if rows >= limit:
+                    break
+        return Sample(recs, bad)
 
 
 def drain(adapters: Iterable[SourceAdapter]) -> list[Record]:

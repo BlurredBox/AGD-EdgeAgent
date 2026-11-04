@@ -3,9 +3,9 @@ corpus/ops_signals.py
 
 Host-operations scalars of the closed z_t schema, and their pure formulas.
 
-These are NOT a new family. Eleven of the fields below are the contract's Group F
+These are NOT a new family. Eleven of the fields below are the Phase 1 Group F
 names already enumerated in `corpus/trajectory.py` SLOTS and
-the field table; this module promotes them from "known to the
+`PLAN/answers/phase-01-fields.md`; this module promotes them from "known to the
 contract" to "accepted on the wire" (`corpus.serving._BASE_SCALARS`) and adds
 exactly two new scalars, `feed_staleness_s` and `host_anomaly_score`.
 
@@ -26,15 +26,15 @@ value=None when the source is unavailable. NEVER 0 for an absent source.
     queue_depth                count       >= 0     mean pending requests
     feed_staleness_s           seconds     >= 0     NEW. Seconds since the last
                                market-data tick for the model's instruments
-                               (max over the declared instruments). The edge
+                               (max over the declared instruments). The v4
                                feed-freshness tripwire input.
-    host_anomaly_score         unitless    finite   NEW. The host detector's
+    host_anomaly_score         unitless    finite   NEW. System A's
                                IsolationForest + flicker output; None while warming up.
 
-UNIT NOTE. The original Group F field table gives cpu/gpu_utilization as percent
-[0,100] and memory_headroom as bytes under a 2GB ceiling. This module
-(2026-10-14) fixes the WIRE units as fractions and a
-headroom fraction. The original table text is therefore stale for those three
+UNIT NOTE. `phase-01-fields.md` Group F gives cpu/gpu_utilization as percent
+[0,100] and memory_headroom as bytes under a 2GB ceiling. This module, at the
+coordinator's direction (2026-10-14), fixes the WIRE units as fractions and a
+headroom fraction. The Phase 1 table text is therefore stale for those three
 fields until amended; an edge agent must follow THIS list.
 
 WHAT THESE ARE FOR. No corpus carries any of them (the replay harness has no
@@ -43,7 +43,7 @@ real host telemetry), so no forecaster was ever fitted on them and
 detector bank and edge tripwires ONLY. They support no forecast-skill claim.
 
 WHERE THIS RUNS. Edge agent, per window, over scalars the host already holds.
-No row content, feature name or customer identifier is read or returned (non-content rule).
+No row content, feature name or customer identifier is read or returned (I-1).
 
 FORMULAS (pure; no clock reads, `now` is passed in -- no lookahead)
   percentile   linear interpolation at rank p*(n-1); identical to the shared

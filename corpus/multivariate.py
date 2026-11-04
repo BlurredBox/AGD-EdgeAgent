@@ -1,7 +1,7 @@
 """
 corpus/multivariate.py
 
-Five multivariate detectors — the failure mode univariate
+Phase 3 Task 2's five multivariate detectors — the failure mode univariate
 tests miss entirely: a correlation-structure break where every marginal is
 unchanged.
 
@@ -9,8 +9,8 @@ unchanged.
 
 Four of these five return a single scalar for the whole vector. Only the
 domain classifier attributes per feature, so for a correlation break it is the
-ONLY thing that can name a feature. The alert-attribution rule forbids an unattributable alert, so
-it is excluded from the load-shedding order entirely.
+ONLY thing that can name a feature. I-4 forbids an unattributable alert, so
+Phase 3 Task 2 §4a excludes it from Phase 8's shed order entirely.
 
 Until this module existed, that mandated capability was specified and absent.
 
@@ -28,14 +28,14 @@ __all__ = ["MultivariateReference", "pca_reconstruction_error",
            "domain_classifier", "mmd_rbf", "mahalanobis_mean",
            "covariance_delta", "top_eigenvalue_ratio", "DomainClassifierResult"]
 
-# MMD is O(n^2). Capped per side so cost is constant per window
+# Task 2 §3: MMD is O(n^2). Capped per side so cost is constant per window
 # rather than quadratic in window size. Field present every window either way.
 MMD_SUBSAMPLE_CAP = 500
 
-# The classifier trains per window, so the reference side is
+# Task 2 §1.2: the classifier trains per window, so the reference side is
 # subsampled to the current window's size -- otherwise it learns "predict
 # reference" and the AUC is meaningless.
-DOMAIN_CLF_MIN_ROWS = 200   # stated minimum
+DOMAIN_CLF_MIN_ROWS = 200   # Task 7's stated minimum
 
 
 @dataclass
@@ -44,14 +44,14 @@ class MultivariateReference:
 
     Everything here is frozen for the reference window's lifetime. Refitting
     per emission window would make every statistic compare against a moving
-    target -- the same error the univariate path avoids by caching bin edges.
+    target -- the same error Task 1 avoids by caching bin edges.
     """
     mean: np.ndarray
     std: np.ndarray
     pca_components: np.ndarray          # (k, p)
     pca_inbase_error: float             # reference's own reconstruction error
     precision: np.ndarray               # inverse Ledoit-Wolf covariance
-    mahalanobis_median: float           # for novelty normalisation
+    mahalanobis_median: float           # for novelty normalisation (Task 5)
     correlation: np.ndarray
     top_eigenvalue: float
     mmd_bandwidth: float                # median heuristic, frozen
@@ -68,7 +68,7 @@ class MultivariateReference:
         std[std == 0] = 1.0             # constant feature: do not divide by 0
         Z = (X - mean) / std
 
-        # --- PCA, components frozen at fit time
+        # --- PCA, components frozen at fit time (Task 2 §1.1)
         cov = np.cov(Z, rowvar=False)
         cov = np.atleast_2d(cov)
         eigvals, eigvecs = np.linalg.eigh(cov)
@@ -87,7 +87,7 @@ class MultivariateReference:
         recon = (Z @ comps.T) @ comps
         inbase = float(np.mean(np.sum((Z - recon) ** 2, axis=1)))
 
-        # --- Ledoit-Wolf shrinkage
+        # --- Ledoit-Wolf shrinkage (Task 2 §1.4)
         precision = _ledoit_wolf_precision(Z)
         d = _mahalanobis(Z, precision)
         maha_median = float(np.median(d)) or 1.0
@@ -116,7 +116,7 @@ class MultivariateReference:
 def _ledoit_wolf_precision(Z: np.ndarray) -> np.ndarray:
     """Inverse covariance under Ledoit-Wolf shrinkage toward a scaled identity.
 
-    Financial features are correlated (near-singular covariance,
+    Task 2 §1.4: financial features are correlated (near-singular covariance,
     so inversion amplifies noise) and heavy-tailed (a few rows dominate the
     sample covariance). Shrinkage fixes the first directly and the second
     partially; MCD would do better on the second but is far more expensive and
@@ -131,7 +131,7 @@ def _ledoit_wolf_precision(Z: np.ndarray) -> np.ndarray:
     d2 = np.sum((S - target) ** 2)
     # Vectorised. The obvious loop -- build x_i x_i^T for each row and sum the
     # squared Frobenius difference from S -- is O(n) in PYTHON and unusable at
-    # the reference-window sizes the contract requires (>= 2000 rows AND >= 24h,
+    # the reference-window sizes Phase 1 requires (>= 2000 rows AND >= 24h,
     # which at realistic window sizes means tens of thousands of rows).
     #
     #   ||x x^T - S||_F^2  =  (x.x)^2  -  2 x^T S x  +  ||S||_F^2
@@ -256,7 +256,7 @@ def mmd_rbf(ref: MultivariateReference, X: np.ndarray, *,
     """Unbiased MMD^2 with an RBF kernel at the frozen reference bandwidth.
 
     Subsampled to `cap` per side so cost is constant per window rather than
-    quadratic in window size. Seeded, so a replay is reproducible.
+    quadratic in window size (Task 2 §4b). Seeded, so a replay is reproducible.
     """
     rng = np.random.default_rng(seed)
     Z_cur = ref.standardise(X)
@@ -292,7 +292,7 @@ def covariance_delta(ref: MultivariateReference, X: np.ndarray) -> float:
     """Frobenius norm of the CORRELATION-matrix difference, normalised.
 
     Correlation rather than covariance so the statistic measures structure
-    rather than scale -- scale movement is already the univariate detectors' job. Divided by
+    rather than scale -- scale movement is already Task 1's job. Divided by
     sqrt(p(p-1)/2), the number of free off-diagonal entries, so it is
     comparable across models with different feature counts.
     """

@@ -1,7 +1,7 @@
 """
 corpus/anomaly.py
 
-Three anomaly detectors: a batch tabular baseline, a genuinely
+Phase 3 Task 3's three detectors: a batch tabular baseline, a genuinely
 streaming one, and an extreme-value threshold method.
 
 HS-Trees is implemented here rather than pulled from a library because its

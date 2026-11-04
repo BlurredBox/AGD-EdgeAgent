@@ -1,5 +1,5 @@
 {
-  "description": "Group D field family: ci_width, derived per the contract formula for a Wald-style 95% CI half-width on a proportion: ci_width = 3.92 * sqrt(p_hat * (1 - p_hat) / N).",
+  "description": "Group D field family: ci_width, derived per Task 1's D-4 formula for a Wald-style 95% CI half-width on a proportion: ci_width = 3.92 * sqrt(p_hat * (1 - p_hat) / N).",
   "field": "D.ci_width",
   "input": {
     "p_hat": 0.12,

@@ -6,7 +6,11 @@ Your raw data stays with you. The agent runs on your infrastructure, and only th
 
 ## Status
 
-Early stage and under active development.
+Early stage and under active development. This repository mirrors the edge agent from BlurredBox release `v0.0.2-rc6` (agent version 0.1.3). Some modules and tests import server code that is not in this repository, so not every test runs from a clean clone.
+
+## Install
+
+Use the install kit you receive from BlurredBox; it installs offline with `--no-index` and does not use a public package index. Installer and service files are in `packaging/edge_agent/`.
 
 ## Licence
 

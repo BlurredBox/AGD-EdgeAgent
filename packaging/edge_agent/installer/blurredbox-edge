@@ -1,0 +1,807 @@
+#!/opt/blurredbox-edge/venv/bin/python
+"""blurredbox-edge: guided setup and day-2 commands for the BlurredBox edge agent.
+
+    blurredbox-edge setup  [flags]   write config, run --check, pair, enable and start the service, print --status
+    blurredbox-edge check            --check against the configured source (as the service user; sends nothing)
+    blurredbox-edge status           --status (read-only local report)
+    blurredbox-edge version
+    blurredbox-edge replay validate|send ...   partner history replay (edge_agent/history_replay.py), run
+                                     as the calling user in the agent's own venv; see `replay --help`
+    blurredbox-edge replay-rejected [--apply] [filters]   list (default) or resend windows the backend
+                                     refused during an outage (edge_agent/replay_rejected.py), as the
+                                     service user; --apply refuses while the service runs (stop it
+                                     first, or pass --while-running)
+    blurredbox-edge incident mark --start T --end T [--model M] [--class C] [--note TEXT]
+    blurredbox-edge incident list | incident delete ID
+                                     mark (list, delete) the times a model failed, signed with the agent's
+                                     key and client certificate (edge_agent/partner_api.py), as the service user
+    blurredbox-edge erase [--yes]    withdraw consent and erase this tenant's telemetry on BlurredBox; asks
+                                     for confirmation unless --yes
+
+`setup` is idempotent: run it again with the same flags and nothing changes except that the service is
+ensured to be running. Flags override what is in the config; anything still missing is asked for
+(unless --non-interactive, which fails naming every missing value instead). --model adds to the models already
+configured (--replace-models makes the given list the whole list). Secrets are never taken
+on the command line: use the environment (AGD_HMAC_SECRET, BLURREDBOX_API_KEY), --hmac-secret-file /
+--api-key-file, or the hidden prompt.
+
+Stop points, in order: nothing is enabled or started unless --check passes and pairing succeeds.
+Exit codes: 0 ok, 2 bad or missing input, 3 --check failed, 4 pairing failed, 5 service did not start.
+
+Standard library only. Linux/systemd is tested; the Windows branch (service control through sc.exe, paths
+under %ProgramData%) is NOT tested on real Windows.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+IS_WIN = os.name == "nt"
+SERVICE = "blurredbox-edge"
+_PD = Path(os.environ.get("ProgramData", r"C:\ProgramData")) if IS_WIN else None
+
+
+def _p(env: str, linux: str, win: str) -> Path:
+    return Path(os.environ.get(env) or (str(_PD / win) if IS_WIN else linux))
+
+
+INSTALL_DIR = _p("BBE_INSTALL_DIR", "/opt/blurredbox-edge", r"BlurredBoxEdge\app")
+CONF_DIR = _p("BBE_CONF_DIR", "/etc/blurredbox-edge", r"BlurredBoxEdge\conf")
+DATA_DIR = _p("BBE_DATA_DIR", "/var/lib/blurredbox-edge", r"BlurredBoxEdge\data")
+SERVICE_USER = os.environ.get("BBE_SERVICE_USER", SERVICE)
+PY = INSTALL_DIR / ("venv/Scripts/python.exe" if IS_WIN else "venv/bin/python")
+CONFIG = CONF_DIR / "config.json"
+ENVFILE = CONF_DIR / "agent.env"
+CERTS = CONF_DIR / "certs"
+PAIRED = DATA_DIR / "setup.json"
+PAIR_TOOL = INSTALL_DIR / "lib" / "partner_pair.py"
+EDGE_CONF_OUT = DATA_DIR / "state" / "edge-configuration.json"   # written by the pairing tool (service user)
+PLACEHOLDER = re.compile(r"<[^<>]*>")
+
+
+class Fail(Exception):
+    def __init__(self, msg: str, code: int = 2) -> None:
+        super().__init__(msg)
+        self.code = code
+
+
+# ----------------------------------------------------------------------------- helpers
+def say(msg: str = "") -> None:
+    try:
+        print(msg, flush=True)
+    except BrokenPipeError:              # kitrun6 C-05: `blurredbox-edge status | head` closed the pipe; exit quietly
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        raise SystemExit(0)
+
+
+def has_placeholder(v) -> bool:
+    return bool(PLACEHOLDER.search(json.dumps(v)))
+
+
+def chown_service(path: Path, mode: int) -> None:
+    os.chmod(path, mode)
+    if not IS_WIN and os.geteuid() == 0:
+        try:
+            import grp
+            import pwd
+            shutil.chown(path, user=SERVICE_USER, group=grp.getgrgid(pwd.getpwnam(SERVICE_USER).pw_gid).gr_name)
+        except KeyError:
+            raise Fail(f"service user {SERVICE_USER!r} does not exist; run install.sh first")
+
+
+def write_atomic(path: Path, data: str, mode: int) -> bool:
+    """Write data to path with the given mode and the service user as owner; returns True if content changed."""
+    old = path.read_text() if path.exists() else None
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        f.write(data)
+    chown_service(tmp, mode)
+    os.replace(tmp, path)
+    return old != data
+
+
+def read_envfile(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                out[k.strip()] = v.strip()
+    return out
+
+
+def as_service(cmd: list[str], env: dict[str, str], **kw) -> subprocess.CompletedProcess:
+    """Run cmd as the service user (when root on Linux) with env, without putting secrets on a command line."""
+    full_env = {**os.environ, **env}
+    if not IS_WIN and os.geteuid() == 0:
+        cmd = ["runuser", "-u", SERVICE_USER, "-m", "--", *cmd]
+        full_env.update(HOME=str(DATA_DIR))
+    return subprocess.run(cmd, env=full_env, cwd=str(DATA_DIR) if DATA_DIR.is_dir() else None, **kw)
+
+
+def ask(prompt: str, *, secret: bool = False, default: str | None = None, interactive: bool) -> str | None:
+    if not interactive:
+        return None
+    shown = f"{prompt}" + (f" [{default}]" if default else "") + ": "
+    v = getpass.getpass(shown) if secret else input(shown)
+    return v.strip() or default
+
+
+def sysctl(*args: str) -> subprocess.CompletedProcess:
+    if IS_WIN:
+        return subprocess.run(["sc.exe", *args], capture_output=True, text=True)
+    return subprocess.run(["systemctl", *args], capture_output=True, text=True)
+
+
+def service_active() -> bool:
+    if IS_WIN:
+        return "RUNNING" in sysctl("query", SERVICE).stdout
+    return sysctl("is-active", "--quiet", SERVICE).returncode == 0
+
+
+def start_service(restart: bool) -> None:
+    if IS_WIN:
+        if restart and service_active():
+            sysctl("stop", SERVICE)
+            time.sleep(3)
+        r = sysctl("start", SERVICE)
+        if r.returncode not in (0, 1056):          # 1056 = already running
+            raise Fail(f"could not start the service: {r.stdout.strip()} {r.stderr.strip()}", 5)
+        return
+    sysctl("daemon-reload")
+    r = sysctl("enable", SERVICE)
+    if r.returncode != 0:
+        raise Fail(f"systemctl enable failed: {r.stderr.strip()}", 5)
+    r = sysctl("restart" if restart else "start", SERVICE)
+    if r.returncode != 0:
+        raise Fail(f"systemctl start failed: {r.stderr.strip()}", 5)
+
+
+# ----------------------------------------------------------------------------- config
+def load_config() -> dict:
+    if not CONFIG.exists():
+        raise Fail(f"{CONFIG} does not exist; run install.sh first")
+    try:
+        return json.loads(CONFIG.read_text())
+    except ValueError as exc:
+        raise Fail(f"{CONFIG} is not valid JSON: {exc}")
+
+
+def parse_models(specs: list[str]) -> dict[str, str]:
+    out = {}
+    for s in specs:
+        local, sep, bb = s.partition("=")
+        if not sep or not local or not bb:
+            raise Fail(f"--model wants LOCAL_NAME=BLURREDBOX_MODEL_ID, got {s!r}")
+        out[local] = bb
+    return out
+
+
+def merge_models(current, given: dict[str, str], *, replace: bool) -> dict[str, str]:
+    """day1pack 2026-10-30: --model used to replace the whole list, so adding a model from the console wizard with
+    only the new --model silently stopped the old ones. --model now adds (or re-points) models and keeps the
+    others; --replace-models makes the given list the whole list. The template's placeholder is never kept."""
+    old = dict(current) if isinstance(current, dict) and not has_placeholder(current) else {}
+    if replace:
+        dropped = sorted(set(old) - set(given))
+        if dropped:
+            say("models: --replace-models stops sending " + ", ".join(dropped))
+        return dict(given)
+    for local, bb in given.items():
+        if local in old and old[local] != bb:
+            say(f"models: {local} now maps to {bb} (was {old[local]})")
+    kept = sorted(set(old) - set(given))
+    if kept:
+        say("models: also keeps " + ", ".join(kept) + " (already configured; --replace-models to send only the "
+            "--model list)")
+    return {**old, **given}
+
+
+def build_source(a: argparse.Namespace, cfg: dict):
+    if a.source_columns and not a.source_folder:
+        raise Fail("--source-columns goes with --source-folder")
+    if a.source_json:
+        try:
+            return json.loads(a.source_json)
+        except ValueError as exc:
+            raise Fail(f"--source-json is not valid JSON: {exc}")
+    if a.source_file:
+        try:
+            return json.loads(Path(a.source_file).read_text())
+        except (OSError, ValueError) as exc:
+            raise Fail(f"--source-file unreadable: {exc}")
+    if a.source_jsonl:
+        return {"type": "jsonl", "path": a.source_jsonl}
+    if a.source_folder:
+        return folder_source(a.source_folder, a.source_columns, cfg.get("source"))
+    return None
+
+
+FOLDER_NEEDS_MAPPING = ("a folder source needs the mapping from your column names to the agent's fields: pass "
+                        "--source-columns FILE (a JSON file with \"columns\" and, if needed, \"constants\"), or the "
+                        "whole source block with --source-file. Nothing was written or started.")
+
+
+def folder_source(path: str, columns_file: str | None, current) -> dict:
+    """day1pack 2026-10-30: `--source-folder DIR` wrote {"type": "folder", "path": DIR} with no column mapping, which
+    the agent refuses. The mapping comes from --source-columns, else from the folder source already configured (a
+    new path for the same files); with neither, setup stops here with exit 2."""
+    src: dict = {"type": "folder", "path": path}
+    if columns_file:
+        try:
+            m = json.loads(Path(columns_file).read_text())
+        except (OSError, ValueError) as exc:
+            raise Fail(f"--source-columns unreadable: {exc}")
+        if not isinstance(m, dict) or not m:
+            raise Fail("--source-columns must hold a JSON object: {\"columns\": {...}, \"constants\": {...}}")
+        if "columns" not in m:              # the bare columns object is accepted too
+            m = {"columns": m}
+        extra = sorted(set(m) - {"columns", "constants"})
+        if extra or not isinstance(m["columns"], dict) or not m["columns"]:
+            raise Fail("--source-columns must hold {\"columns\": {...}} and optionally \"constants\"; got "
+                       + (f"unknown key(s) {extra}" if extra else "no columns"))
+        src.update(m)
+    elif (isinstance(current, dict) and current.get("type") == "folder" and isinstance(current.get("columns"), dict)
+          and not has_placeholder(current)):
+        src = {**current, "path": path}
+    else:
+        raise Fail(FOLDER_NEEDS_MAPPING, 2)
+    return src
+
+
+def stage_certs(a: argparse.Namespace, cfg: dict) -> None:
+    given = [a.client_cert, a.client_key, a.p12]
+    if not any(given):
+        return
+    CERTS.mkdir(parents=True, exist_ok=True)
+    chown_service(CERTS, 0o750)
+    if a.p12:
+        if not shutil.which("openssl"):
+            raise Fail("--p12 needs the openssl command; extract client.pem/client.key yourself and use --client-cert/--client-key")
+        pass_file = a.p12_pass_file or os.environ.get("BBE_P12_PASS_FILE")
+        if not pass_file:
+            raise Fail("--p12 needs --p12-pass-file (the passphrase is never taken on the command line)")
+        for args, dest, mode in ((["-clcerts", "-nokeys"], "client.pem", 0o644),
+                                 (["-nocerts", "-nodes"], "client.key", 0o600),
+                                 (["-cacerts", "-nokeys"], "server-ca.pem", 0o644)):
+            r = subprocess.run(["openssl", "pkcs12", "-in", a.p12, "-passin", f"file:{pass_file}", *args],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise Fail(f"openssl could not read the .p12: {r.stderr.strip()[:200]}")
+            if dest == "server-ca.pem" and "BEGIN CERTIFICATE" not in r.stdout:
+                continue
+            target = CERTS / dest
+            write_atomic(target, r.stdout, mode)
+        cfg["client_cert"] = [str(CERTS / "client.pem"), str(CERTS / "client.key")]
+    else:
+        if not (a.client_cert and a.client_key):
+            raise Fail("--client-cert and --client-key go together")
+        for src, dest, mode in ((a.client_cert, "client.pem", 0o644), (a.client_key, "client.key", 0o600)):
+            try:
+                write_atomic(CERTS / dest, Path(src).read_text(), mode)
+            except OSError as exc:
+                raise Fail(f"cannot read {src}: {exc}")
+        cfg["client_cert"] = [str(CERTS / "client.pem"), str(CERTS / "client.key")]
+    if a.ca_file:
+        write_atomic(CERTS / "ca.pem", Path(a.ca_file).read_text(), 0o644)
+        cfg["ca_file"] = str(CERTS / "ca.pem")
+
+
+def secret_value(name: str, env_name: str, file_arg: str | None, interactive: bool, existing: dict[str, str]) -> str:
+    if file_arg:
+        try:
+            return Path(file_arg).read_text().strip()
+        except OSError as exc:
+            raise Fail(f"cannot read {file_arg}: {exc}")
+    if os.environ.get(env_name):
+        return os.environ[env_name].strip()
+    if existing.get(env_name) and not has_placeholder(existing[env_name]):
+        return existing[env_name]
+    v = ask(name, secret=True, interactive=interactive)
+    if not v:
+        raise Fail(f"missing {name}: set {env_name} in the environment, pass a file flag, or run interactively")
+    return v
+
+
+def missing_values(cfg: dict, need_cert: bool) -> list[str]:
+    miss = []
+    for k in ("tenant_id", "install_id", "output_kind"):
+        if not cfg.get(k) or has_placeholder(cfg[k]):
+            miss.append(k)
+    if not cfg.get("models") or has_placeholder(cfg["models"]):
+        miss.append("models")
+    if not cfg.get("endpoints") or has_placeholder(cfg["endpoints"]):
+        miss.append("endpoints (console URL)")
+    if "source" not in cfg or has_placeholder(cfg["source"]):
+        miss.append("source")
+    for k in ("outcome_source", "proxy_source", "upstream_source"):
+        if k in cfg and has_placeholder(cfg[k]):
+            miss.append(f"{k} (still the template placeholder {PLACEHOLDER.search(json.dumps(cfg[k])).group(0)}; "
+                        f"fill it in or delete the {k} block from {CONFIG})")
+    if need_cert and not cfg.get("client_cert"):
+        miss.append("client certificate (--client-cert/--client-key, --p12, or --no-client-cert)")
+    return miss
+
+
+# ----------------------------------------------------------------------------- commands
+def run_check(env: dict[str, str], full: bool = False) -> tuple[bool, str]:
+    """(passed, verdict). The verdict is SOURCE_COMPATIBLE, CAUGHT_UP (passes: no new row now, but this install has
+    built windows from the source before), NOT_READY or NO_ROWS_YET (empty source on a fresh install, D-10)."""
+    r = as_service([str(PY), "-m", "edge_agent", "--config", str(CONFIG), "--check"], env,
+                   capture_output=True, text=True)
+    out = (r.stdout or "").strip()
+    try:
+        rep = json.loads(out.splitlines()[-1]) if out else {}
+    except ValueError:
+        rep = {}
+    if rep and not full:      # the full report (with the field contract) is `blurredbox-edge check`
+        rep = {k: rep[k] for k in ("verdict", "message", "config_error", "source_error", "outcome_source_error",
+                                   "source_check", "outcome_source_check") if k in rep}
+        say(json.dumps(rep, sort_keys=True))
+    else:
+        say(out)
+    if r.stderr.strip() and r.returncode != 0:
+        say(r.stderr.strip())
+    return r.returncode == 0, str(rep.get("verdict", ""))
+
+
+def pair(cfg: dict, codes: dict[str, str], env: dict[str, str], ca_for_pairing: str | None) -> dict[str, float | None]:
+    """Pair (code given) or re-acknowledge (already paired) every BlurredBox model.
+
+    Returns {BlurredBox model id: the window cadence in minutes the server holds for it (None if it holds none)}."""
+    if not PAIR_TOOL.exists():
+        raise Fail(f"{PAIR_TOOL} is missing; reinstall with install.sh", 4)
+    try:
+        paired = json.loads(PAIRED.read_text()).get("paired", []) if PAIRED.exists() else []
+    except ValueError:
+        paired = []
+    specs, todo = [], []
+    for bb in cfg["models"].values():
+        if bb in codes:
+            specs.append(f"{bb}:{codes[bb]}")
+        elif bb in paired:
+            specs.append(bb)
+        else:
+            todo.append(bb)
+    if todo:
+        raise Fail("no pairing code for model(s) " + ", ".join(todo) +
+                   ": pass --pairing-code=CODE (one model) or --pair MODEL_ID:CODE; "
+                   "BlurredBox mints a code in the console and it lasts 10 minutes", 2)
+    cmd = [str(PY), str(PAIR_TOOL), "--base-url", cfg["endpoints"][0], "--install-id", cfg["install_id"]]
+    for s in specs:
+        cmd += ["--model", s]
+    if ca_for_pairing:
+        cmd += ["--ca-file", ca_for_pairing]
+    EDGE_CONF_OUT.unlink(missing_ok=True)
+    cmd += ["--edge-config-out", str(EDGE_CONF_OUT)]
+    r = as_service(cmd, env, capture_output=True, text=True)
+    say((r.stdout or "").strip())
+    if r.returncode != 0:
+        say((r.stderr or "").strip())
+        raise Fail(pairing_failure_message(r.stderr or ""), 4)
+    try:
+        held = json.loads(EDGE_CONF_OUT.read_text()) if EDGE_CONF_OUT.exists() else {}
+    except ValueError:
+        held = {}
+    EDGE_CONF_OUT.unlink(missing_ok=True)
+    out: dict[str, float | None] = {}
+    for bb in cfg["models"].values():
+        c = (held.get(bb) or {}).get("cadence_minutes")
+        out[bb] = float(c) if isinstance(c, (int, float)) and not isinstance(c, bool) and c > 0 else None
+    return out
+
+
+def pairing_failure_message(stderr: str) -> str:
+    """Kit dry run 2026-10-31 (K-09): a TLS refusal or an unreadable CA file also ended in "A code lasts 10 minutes:
+    ask for a new one", so the partner asked for codes while the code was never sent. Name the real cause when the
+    pairing tool's output shows the request never reached the server."""
+    base = "pairing failed; the service was not enabled. "
+    if "CERTIFICATE_VERIFY_FAILED" in stderr or "SSLError" in stderr or "SSL:" in stderr:
+        return (base + "The TLS connection to the pilot host was refused (the server certificate was not trusted), so "
+                "the code was not used. A TLS-inspecting proxy causes this (exempt the pilot host); pass --ca-file / "
+                "--pairing-ca-file only if BlurredBox gave you a CA file. Then re-run setup with the same code.")
+    if "PermissionError" in stderr:
+        return (base + "A file the pairing step needs could not be read by the blurredbox-edge user (for example a "
+                "--ca-file under /root), so the code was not used. Put it where that user can read it (mode 0644) and "
+                "re-run setup with the same code.")
+    if "ConnectError" in stderr or "ConnectTimeout" in stderr or "Name or service not known" in stderr:
+        return (base + "The pilot host could not be reached (network, DNS, proxy or firewall), so the code was not "
+                "used. Check outbound TCP 443 and re-run setup with the same code.")
+    return base + "A code lasts 10 minutes: ask for a new one and re-run setup."
+
+
+def resolve_cadence(a: argparse.Namespace, cfg: dict, held: dict[str, float | None]) -> int | None:
+    """The agent's window cadence in seconds: --cadence-seconds, else the model's cadence as the server holds it
+    (rehearsal 2026-10-29 D-07: the template's 300 s was kept for a 30-second model). None = keep the config's value."""
+    if a.cadence_seconds:
+        return a.cadence_seconds
+    known = {bb: c for bb, c in held.items() if c is not None}
+    secs = {int(round(c * 60)) for c in known.values()}
+    if not secs:
+        return None
+    if len(secs) > 1:
+        raise Fail("the models have different window cadences on the server ("
+                   + ", ".join(f"{bb}: {c:g} min" for bb, c in sorted(known.items()))
+                   + "). One agent sends at one cadence: install one agent per cadence, or pass --cadence-seconds. "
+                   "The service was not enabled.", 2)
+    return max(1, secs.pop())
+
+
+def cmd_setup(a: argparse.Namespace) -> int:
+    interactive = not a.non_interactive and sys.stdin.isatty()
+    cfg = load_config()
+    before = json.dumps(cfg, sort_keys=True)
+    if a.console_url:
+        cfg["endpoints"] = [a.console_url]
+    for k, v in (("tenant_id", a.tenant_id), ("install_id", a.install_id), ("output_kind", a.output_kind)):
+        if v:
+            cfg[k] = v
+    if a.replace_models and not a.model:
+        raise Fail("--replace-models needs the full list of --model flags to keep")
+    if a.model:
+        cfg["models"] = merge_models(cfg.get("models"), parse_models(a.model), replace=a.replace_models)
+    src = build_source(a, cfg)
+    if src is not None:
+        cfg["source"] = src
+    cfg["state_dir"] = str(DATA_DIR / "state")
+    cfg["secret_env"] = "AGD_HMAC_SECRET"
+    if a.no_client_cert:
+        cfg.pop("client_cert", None)
+    if a.cadence_seconds is not None and a.cadence_seconds < 1:
+        raise Fail("--cadence-seconds must be at least 1")
+    if a.cadence_seconds:
+        cfg["cadence_seconds"] = a.cadence_seconds
+    stage_certs(a, cfg)
+
+    # Ask for what is still missing (one by one), or fail naming all of it.
+    prompts = {"tenant_id": "Tenant id", "install_id": "Install id (letters, digits, _ . : -)",
+               "output_kind": "Model output kind (probability|signed)"}
+    for k, label in prompts.items():
+        if (not cfg.get(k) or has_placeholder(cfg[k])):
+            v = ask(label, interactive=interactive)
+            if v:
+                cfg[k] = v
+    if not cfg.get("endpoints") or has_placeholder(cfg["endpoints"]):
+        v = ask("Console URL (e.g. https://pilot.blurredbox-agd.com)", interactive=interactive)
+        if v:
+            cfg["endpoints"] = [v]
+    if not cfg.get("models") or has_placeholder(cfg["models"]):
+        v = ask("Model as LOCAL_NAME=BLURREDBOX_MODEL_ID", interactive=interactive)
+        if v:
+            cfg["models"] = parse_models([v])
+    if "source" not in cfg or has_placeholder(cfg["source"]):
+        v = ask("Path of the model's JSON-lines prediction log (or a folder; use --source-json for PostgreSQL)",
+                interactive=interactive)
+        if v and Path(v).is_dir():
+            m = ask("Path of the JSON file with the folder's column mapping (--source-columns)", interactive=True)
+            cfg["source"] = folder_source(v, m or None, cfg.get("source"))
+        elif v:
+            cfg["source"] = {"type": "jsonl", "path": v}
+    if not a.no_client_cert and not cfg.get("client_cert") and interactive:
+        v = ask("Path of client.pem (empty = none)", interactive=True)
+        k = ask("Path of client.key", interactive=True) if v else None
+        if v and k:
+            a.client_cert, a.client_key = v, k
+            stage_certs(a, cfg)
+    miss = missing_values(cfg, need_cert=not a.no_client_cert)
+    # kitrun6 R-03: what to put back if the new config fails its check. Only a config that was already complete and
+    # set up (paired, or the service running) counts as working; a first, never-passing config is simply replaced.
+    previous = None
+    try:
+        old_cfg = json.loads(before)
+        if not missing_values(old_cfg, need_cert=bool(old_cfg.get("client_cert"))) and (PAIRED.exists() or service_active()):
+            previous = (CONFIG.read_text(), ENVFILE.read_text() if ENVFILE.exists() else None)
+    except (OSError, ValueError):
+        previous = None
+    if miss:
+        raise Fail("missing: " + ", ".join(miss) + ". Pass them as flags (see --help) or run on a terminal.", 2)
+    if cfg["output_kind"] not in ("probability", "signed"):
+        raise Fail("output_kind must be 'probability' or 'signed'")
+
+    # Secrets -> agent.env (0600, service user). Existing values are kept unless a new one is supplied.
+    existing = read_envfile(ENVFILE)
+    hmac_secret = secret_value("Signing secret", "AGD_HMAC_SECRET", a.hmac_secret_file, interactive, existing)
+    api_key = secret_value("API key", "BLURREDBOX_API_KEY", a.api_key_file, interactive, existing)
+    env_data = {**existing, "AGD_HMAC_SECRET": hmac_secret, "BLURREDBOX_API_KEY": api_key}
+    for kv in a.env or []:
+        k, sep, v = kv.partition("=")
+        if not sep:
+            raise Fail("--env wants NAME=VALUE")
+        env_data[k] = v
+    for name in a.env_from_environment or []:
+        if name not in os.environ:
+            raise Fail(f"--env-from-environment {name}: not set in the environment")
+        env_data[name] = os.environ[name]
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "state").mkdir(exist_ok=True)
+    chown_service(DATA_DIR / "state", 0o700)
+    env_changed = write_atomic(ENVFILE, "".join(f"{k}={v}\n" for k, v in sorted(env_data.items())), 0o600)
+    cfg_changed = write_atomic(CONFIG, json.dumps(cfg, indent=2) + "\n", 0o640) or json.dumps(cfg, sort_keys=True) != before
+    say(f"config: {CONFIG} (0640, {SERVICE_USER})")
+
+    run_env = dict(env_data)
+    say("== step 1/3: --check (reads a sample of the source; sends nothing)")
+    passed, verdict = run_check(run_env)
+    if not passed and previous is not None and json.dumps(cfg, sort_keys=True) != before:
+        write_atomic(CONFIG, previous[0], 0o640)
+        if previous[1] is not None:
+            write_atomic(ENVFILE, previous[1], 0o600)
+        raise Fail(f"--check did not pass ({verdict or 'NOT_READY'}) with the new settings, so they were NOT applied: "
+                   f"the previous working config was put back in {CONFIG} and the service was not touched. Fix the "
+                   "new source or settings and re-run setup.", 3)
+    if verdict == "NO_ROWS_YET":
+        raise Fail("--check found no rows yet in the source: waiting for data. The config is not at fault. "
+                   "Nothing was enabled or started. Re-run setup once the model has written its first prediction "
+                   f"to {cfg.get('source', {}).get('path') or 'the source'}.", 3)
+    if not passed:
+        raise Fail("--check did not pass. Nothing was enabled or started. Fix the source or the config "
+                   f"({CONFIG}) and re-run setup.", 3)
+
+    say("== step 2/3: pairing")
+    codes = parse_codes(a, cfg)
+    ca_for_pairing = a.pairing_ca_file
+    held = pair(cfg, codes, run_env, ca_for_pairing)
+    done = list(held)
+    cadence = resolve_cadence(a, cfg, held)
+    if cadence is not None and cfg.get("cadence_seconds") != cadence:
+        cfg["cadence_seconds"] = cadence
+        write_atomic(CONFIG, json.dumps(cfg, indent=2) + "\n", 0o640)
+        cfg_changed = True
+    say(f"cadence: one window every {cfg.get('cadence_seconds', 300)} s"
+        + (" (--cadence-seconds)" if a.cadence_seconds else " (the model's cadence on the server)" if cadence else ""))
+    prev = []
+    try:
+        prev = json.loads(PAIRED.read_text()).get("paired", []) if PAIRED.exists() else []
+    except ValueError:
+        pass
+    PAIRED.write_text(json.dumps({"paired": sorted(set(prev) | set(done))}) + "\n")
+
+    say("== step 3/3: enable and start the service")
+    start_service(restart=cfg_changed or env_changed or a.restart)
+    ok = False
+    for _ in range(20):
+        if service_active():
+            ok = True
+            break
+        time.sleep(0.5)
+    if not ok:
+        raise Fail(f"the service did not become active; see: journalctl -u {SERVICE}", 5)
+    time.sleep(2)
+    if not service_active():
+        raise Fail(f"the service exited right after starting; see: journalctl -u {SERVICE}", 5)
+    say("== status")
+    status_summary()
+    return 0
+
+
+SETUP_STATUS = DATA_DIR / "setup-status.json"
+
+
+def configured_sources() -> str:
+    """Rehearsal 3 R3-06: the summary counted the agent's read offsets, which are empty right after start, so a
+    configured source read "0 configured". Count what config.json declares instead."""
+    try:
+        cfg = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return "unknown (config.json unreadable)"
+    kinds = [f"{(cfg[k] or {}).get('type', '?')} {label}" for k, label in (("source", "predictions"),
+                                                                            ("outcome_source", "outcomes"))
+             if isinstance(cfg.get(k), dict)]
+    return f"{len(kinds)} configured" + (f" ({', '.join(kinds)})" if kinds else "")
+
+
+def status_summary() -> None:
+    """Rehearsal 2 N-07: setup ended with a ~5 KB single-line JSON dump. Print a few lines; the full
+    report goes to a file (and `blurredbox-edge status` prints it again at any time)."""
+    r = as_service([str(PY), "-m", "edge_agent", "--config", str(CONFIG), "--status"], read_envfile(ENVFILE),
+                   capture_output=True, text=True)
+    out = (r.stdout or "").strip()
+    try:
+        rep = json.loads(out.splitlines()[-1]) if out else {}
+    except ValueError:
+        rep = {}
+    if not rep:
+        say((out or r.stderr or "").strip())
+        return
+    try:
+        write_atomic(SETUP_STATUS, json.dumps(rep, indent=2, sort_keys=True, default=str) + "\n", 0o640)
+        where = str(SETUP_STATUS)
+    except OSError:
+        where = ""
+    spool = rep.get("spool") or {}
+    say(f"service      : running ({SERVICE})")
+    say(f"state dir    : {'present' if rep.get('state_dir_exists') else 'missing'}")
+    say(f"sources      : {configured_sources()}")
+    say(f"spool        : {spool.get('queued', 0)} queued, {spool.get('rejected', 0)} rejected by the server")
+    snap = rep.get("agent_snapshot") or {}
+    models = snap.get("models") or {}
+    if models:
+        withheld = sum(int(m.get("withheld", 0) or 0) for m in models.values())
+        skipped = sum(int(m.get("skipped", 0) or 0) for m in models.values())
+        late = sum(int(m.get("late_rows_dropped", 0) or 0) for m in models.values())
+        say(f"windows      : {withheld} sent with statistics withheld (journal: window_rejected), {skipped} skipped "
+            f"(too few rows), {late} late rows dropped")
+    say("full status  : " + (f"{where} (or run `blurredbox-edge status`)" if where else "run `blurredbox-edge status`"))
+
+
+def parse_codes(a: argparse.Namespace, cfg: dict) -> dict[str, str]:
+    codes: dict[str, str] = {}
+    for s in a.pair or []:
+        m, sep, c = s.partition(":")
+        if not sep or not m or not c:
+            raise Fail("--pair wants BLURREDBOX_MODEL_ID:CODE")
+        codes[m] = c
+    code = a.pairing_code or os.environ.get("BBE_PAIRING_CODE")
+    if code:
+        # With --model adding to the list, the code is for the model(s) named on this run; among several, the
+        # one not paired yet.
+        bbs = list(dict.fromkeys(parse_models(a.model).values() if a.model else cfg["models"].values()))
+        if len(bbs) > 1:
+            try:
+                paired = set(json.loads(PAIRED.read_text()).get("paired", [])) if PAIRED.exists() else set()
+            except ValueError:
+                paired = set()
+            new = [b for b in bbs if b not in paired]
+            bbs = new if len(new) == 1 else bbs
+        if len(bbs) != 1:
+            raise Fail("--pairing-code works for exactly one model; use --pair MODEL_ID:CODE for several")
+        codes[bbs[0]] = code
+    return codes
+
+
+def cmd_check(a: argparse.Namespace) -> int:
+    passed, verdict = run_check(read_envfile(ENVFILE), full=True)
+    if verdict == "NO_ROWS_YET":
+        say("no rows yet: waiting for data. Run `blurredbox-edge check` again after the model writes its first row.")
+    elif verdict == "CAUGHT_UP":
+        say("caught up: no row to read right now, and the agent has already built windows from this source. Healthy.")
+    return 0 if passed else 3
+
+
+def cmd_status(a: argparse.Namespace) -> int:
+    r = as_service([str(PY), "-m", "edge_agent", "--config", str(CONFIG), "--status"], read_envfile(ENVFILE),
+                   capture_output=True, text=True)
+    say((r.stdout or r.stderr).strip())
+    return r.returncode
+
+
+def cmd_version(a: argparse.Namespace) -> int:
+    v = INSTALL_DIR / "VERSION"
+    say(v.read_text().strip() if v.exists() else "unknown")
+    return 0
+
+
+def cmd_replay(rest: list[str]) -> int:
+    """The history replay kit, from the installed wheel (no repository checkout). It runs as the calling
+    user, not the service user: it reads the export the user points it at and writes only under --out."""
+    return subprocess.call([str(PY), "-m", "edge_agent.history_replay", *rest])
+
+
+def cmd_replay_rejected(rest: list[str]) -> int:
+    """Resend windows from the spool's rejected/ directory (dry run unless --apply), as the service user with
+    agent.env (the secret and API key stay in the environment). With --apply, the running service could
+    send a newer window of the same model between two resends and make the older one out of order, so it
+    is refused while the service is active unless --while-running is given."""
+    rest = list(rest)
+    while_running = "--while-running" in rest
+    rest = [x for x in rest if x != "--while-running"]
+    if "--apply" in rest and not while_running and service_active():
+        stop = f"sc.exe stop {SERVICE}" if IS_WIN else f"systemctl stop {SERVICE}"
+        raise Fail(f"the {SERVICE} service is running; stop it first ({stop}), run the replay, then start it "
+                   "again; or pass --while-running")
+    return as_service([str(PY), "-m", "edge_agent", "replay-rejected", "--config", str(CONFIG), *rest],
+                      read_envfile(ENVFILE)).returncode
+
+
+def cmd_partner_api(argv: list[str]) -> int:
+    """`incident ...` / `erase ...`: one signed call with the agent's config, client certificate and agent.env
+    (secret and API key stay in the environment), as the service user that can read the key files."""
+    return as_service([str(PY), "-m", "edge_agent", argv[0], *argv[1:], "--config", str(CONFIG)],
+                      read_envfile(ENVFILE)).returncode
+
+
+DASH_VALUE_OPTIONS = ("--pairing-code",)
+
+
+def attach_dash_values(argv: list[str], parser: argparse.ArgumentParser) -> list[str]:
+    """`--pairing-code -Xy...` -> `--pairing-code=-Xy...`.
+
+    A code issued before 2026-10-31 starts with '-' about 1 time in 64, and argparse reads such a value as an
+    option ("expected one argument"). `--pairing-code=<CODE>` always works; this accepts the spaced form too,
+    unless the next word is (an abbreviation of) one of setup's own options, which still fails as before."""
+    known = [o for o in parser._option_string_actions if o.startswith("--")] + ["-h"]
+    out, i = [], 0
+    while i < len(argv):
+        w = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if w in DASH_VALUE_OPTIONS and nxt is not None and nxt.startswith("-"):
+            head = nxt.split("=", 1)[0]
+            if not (head == "-h" or (head.startswith("--") and len(head) > 2
+                                     and any(o.startswith(head) for o in known))):
+                out.append(f"{w}={nxt}")
+                i += 2
+                continue
+        out.append(w)
+        i += 1
+    return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] in (["incident"], ["erase"]):   # its own argparse in the package (edge_agent/partner_api.py)
+        if argv[:1] == ["incident"] and (len(argv) < 2 or argv[1].startswith("-")):
+            return subprocess.call([str(PY), "-m", "edge_agent", *argv])     # usage / --help
+        return cmd_partner_api(argv)
+    if argv[:1] == ["replay"]:                  # its own argparse (validate / send) in the package
+        return cmd_replay(argv[1:])
+    if argv[:1] == ["replay-rejected"]:         # its own argparse in the package (edge_agent/replay_rejected.py)
+        try:
+            return cmd_replay_rejected(argv[1:])
+        except Fail as exc:
+            print(f"blurredbox-edge: {exc}", file=sys.stderr)
+            return exc.code
+    ap = argparse.ArgumentParser(prog="blurredbox-edge", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("setup", help="guided or flag-driven setup (idempotent)")
+    s.add_argument("--console-url", help="BlurredBox console base URL, e.g. https://pilot.blurredbox-agd.com")
+    s.add_argument("--tenant-id")
+    s.add_argument("--install-id")
+    s.add_argument("--model", action="append", metavar="LOCAL=BBID",
+                   help="your model name = BlurredBox model id (repeatable); adds to the models already configured")
+    s.add_argument("--replace-models", action="store_true",
+                   help="make the --model list the whole list (models not named stop being sent)")
+    s.add_argument("--output-kind", choices=["probability", "signed"])
+    s.add_argument("--source-jsonl", metavar="PATH", help="JSON-lines prediction log")
+    s.add_argument("--source-folder", metavar="DIR",
+                   help="folder of CSV/Parquet files; needs --source-columns (or a folder source already configured)")
+    s.add_argument("--source-columns", metavar="FILE",
+                   help="JSON file with the folder's column mapping: {\"columns\": {...}, \"constants\": {...}}")
+    s.add_argument("--source-json", metavar="JSON", help="the whole source block (PostgreSQL, folder with columns, ...)")
+    s.add_argument("--source-file", metavar="FILE", help="file holding the source block as JSON")
+    s.add_argument("--pairing-code", help="pairing code from the console (one model); or env BBE_PAIRING_CODE")
+    s.add_argument("--pair", action="append", metavar="BBID:CODE", help="pairing code per BlurredBox model id (repeatable)")
+    s.add_argument("--pairing-ca-file", help="pass --ca-file to the pairing tool (only if BlurredBox says so)")
+    s.add_argument("--client-cert"); s.add_argument("--client-key"); s.add_argument("--ca-file")
+    s.add_argument("--p12"); s.add_argument("--p12-pass-file")
+    s.add_argument("--no-client-cert", action="store_true", help="do not configure a client certificate (lab only)")
+    s.add_argument("--hmac-secret-file"); s.add_argument("--api-key-file")
+    s.add_argument("--env", action="append", metavar="NAME=VALUE", help="extra variable for agent.env (e.g. a non-secret setting)")
+    s.add_argument("--env-from-environment", action="append", metavar="NAME", help="copy NAME from this environment into agent.env (e.g. EDGE_PG_PASSWORD)")
+    s.add_argument("--cadence-seconds", type=int, metavar="N",
+                   help="window cadence in seconds (default: the model's cadence as BlurredBox holds it)")
+    s.add_argument("--non-interactive", action="store_true")
+    s.add_argument("--restart", action="store_true", help="restart the service even if nothing changed")
+    s.set_defaults(fn=cmd_setup)
+    for name, fn in (("check", cmd_check), ("status", cmd_status), ("version", cmd_version)):
+        sub.add_parser(name).set_defaults(fn=fn)
+    sub.add_parser("replay", help="partner history replay: validate | send (see `blurredbox-edge replay --help`)")
+    sub.add_parser("incident", help="mark, list or delete incident marks (see `blurredbox-edge incident --help`)")
+    sub.add_parser("erase", help="withdraw consent and erase this tenant's telemetry on BlurredBox (asks first)")
+    sub.add_parser("replay-rejected", help="list or resend (--apply) windows refused during an outage "
+                                           "(see `blurredbox-edge replay-rejected --help`)")
+    if argv[:1] == ["setup"]:
+        argv = attach_dash_values(argv, s)
+    a = ap.parse_args(argv)
+    try:
+        return a.fn(a)
+    except Fail as exc:
+        print(f"blurredbox-edge: {exc}", file=sys.stderr)
+        return exc.code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,6 @@
+# Extra for "source": {"type": "kafka"}. Pinned from requirements-lock.txt (Python 3.12).
+# Install on top of requirements-edge.txt:  pip install -r requirements-edge-kafka.txt
+# confluent-kafka bundles librdkafka (TLS, SASL PLAIN / SCRAM / OAUTHBEARER); fastavro is used only
+# for value_format "avro". The base install contains neither.
+confluent-kafka==2.12.2
+fastavro==1.12.1

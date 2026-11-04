@@ -104,3 +104,15 @@ def test_id_map_is_on_disk_with_names_and_not_sent(live_run):
     assert FEATURES[0] in f.read_text()
     assert FEATURES[0] not in _everything_on_the_wire(agent, sink)
 
+
+def test_requests_are_sdk_signed_and_backend_validators_accept_them(live_run):
+    agent, sink, recs, cfg = live_run
+    from src.api.signal_ingest import SignalEnvelope, _validate_z_t
+    for url, path, body, headers in sink.requests:
+        assert path == "/api/v1/ingest/signal"
+        assert {"X-AGD-Signature", "X-AGD-Timestamp", "X-AGD-Nonce"} <= set(headers)
+        env = SignalEnvelope(**json.loads(body))
+        accepted, unknown, refused = _validate_z_t(env.z_t, edge_ahead_minor=False)
+        assert unknown == [] and refused == []
+        assert accepted == env.z_t
+        assert env.window_timestamp.tzinfo is not None

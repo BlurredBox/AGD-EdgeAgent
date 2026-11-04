@@ -38,7 +38,7 @@ _TEXT_FIELDS = {"reference_window_id", "schema_version", "warmup_state",
 
 
 class WireViolation(ValueError):
-    """The payload would not be an acceptable, allow-listed, raw-data-free `z_t`. Never sent."""
+    """The payload would not be an acceptable, I-1-clean `z_t`. Never sent."""
 
 
 def _num(v: Any) -> Any:

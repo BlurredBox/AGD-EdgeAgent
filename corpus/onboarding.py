@@ -1,11 +1,11 @@
 """
 corpus/onboarding.py
 
-Onboarding validator: tells an integrator BEFORE go-live whether the
+Onboarding validator: tells a design partner (and us) BEFORE go-live whether the
 telemetry they will send can produce a forecast, and says which fields to fix
 when it cannot.
 
-Why this exists. A deployment that sends "timestamp, model, daily AUC" supplies none
+Why this exists. A partner who sends "timestamp, model, daily AUC" supplies none
 of the signal-vector fields the forecaster bundle selects, and nothing raises:
 `ForecasterBundle.predict` NaN-fills (or, on the deployed path, refuses the
 horizons that need an absent column) and the product shows nothing. This module
@@ -13,8 +13,8 @@ makes that failure loud and names the fields.
 
 Everything here is LOCAL and READ-ONLY. It never opens a socket; the telemetry
 file is read, analysed in memory and summarised as counts and field NAMES. The
-same functions (`analyse_model`) are what a server-side diagnostic
-runs over stored windows, so the two cannot
+same functions (`analyse_model`) are what the server-side diagnostic in
+`src/api/onboarding_diagnostics.py` runs over stored windows, so the two cannot
 disagree about what "missing" or "all-NaN" means.
 
 Nothing is remembered from documents: the required-field list is DERIVED from a
@@ -109,24 +109,24 @@ def collection_contract(output_kind: str, required: "RequiredSpec | None" = None
                       for path in spec.by_path},
             "raw_data_boundary": "local_only"}
 
-# The server runtime limits cadence to (0, 60] minutes:
+# `RuntimeConfig.cadence_minutes` is `Field(gt=0, le=60)` (src/api/signal_runtime.py):
 # a channel cannot be configured for a cadence above an hour.
 RUNTIME_CADENCE_MAX_MINUTES = 60.0
 # A file's cadence is regular enough to convert windows to wall-clock when this
-# share of its intervals equal the median (same bar as the server-side replay).
+# share of its intervals equal the median (same bar as scripts/replay_partner_telemetry.py).
 CADENCE_REGULARITY_BAR = 0.90
 GAP_FACTOR = 3.0          # an interval this many times the median is a gap
 
-# Fields that need REALISED OUTCOMES (labels), which a trading/ops deployment often
-# cannot supply.
+# Fields that need REALISED OUTCOMES (labels), which a trading/ops partner often
+# cannot supply: `scripts/replay_partner_telemetry.py::RECORD_FIELDS_NEED_OUTCOME`.
 OUTCOME_FIELDS = frozenset({"brier", "nll", "ece", "mce", "realised_metric", "ci_width"})
 
 # ── What the bundle needs ───────────────────────────────────────────────────
 
-# The selected feature columns, per horizon, of the reference
-# forecaster artifact (the hosted
+# The selected feature columns, per horizon, of the forecaster at
+# agd-merged/artifacts/forecaster/forecaster.pkl on the build host (the hosted
 # sandbox's artifact), read with `ForecasterBundle.features_by_horizon`.
-# An upstream validator test re-derives this from the pickle when it is
+# tests/test_onboarding_validator.py re-derives this from the pickle when it is
 # present and fails on any drift, so this is a snapshot with a tripwire, not a
 # memory. `--bundle DIR` (or the server's live bundle) replaces it.
 SANDBOX_BUNDLE_SHA256 = "21abffc554f68c49eabb2994ff120b1c76ec3e53c7e4770a0831eac5c66f9cb1"
@@ -149,12 +149,12 @@ SANDBOX_BUNDLE_FEATURES: dict[int, tuple[str, ...]] = {
          "domain_classifier_auc__ewma", "covariance_delta_frobenius__ewma"),
 }
 
-# The learned detector (manifest sha256 below) does not read the live
+# The learned detector (learned-v6-armA, manifest sha256 below) does not read the live
 # forecaster's hazards: it reads the six hazards of its OWN paired forecaster, and the
 # deployed path refuses a horizon whose selected column is absent, so one absent field =
 # no hazard at that horizon = `hazards_missing` = the detector never goes live. Its
 # required fields are therefore the paired bundle's selected columns, NOT the live
-# bundle's. Snapshot of its paired `forecaster.pkl`; the same tripwire
+# bundle's. Snapshot of `learned-v6-armA/forecaster/forecaster.pkl`; the same tripwire
 # test re-derives it from the pickle.
 PATH_LIVE = "live_forecast"
 PATH_LEARNED = "learned_detector"
@@ -200,7 +200,7 @@ SANDBOX_PAIRED_FEATURES: dict[int, tuple[str, ...]] = {
 
 @dataclass(frozen=True)
 class FieldNeed:
-    """One thing a deployment must send: a wire field, or one key of `score_quantiles`."""
+    """One thing a partner must send: a wire field, or one key of `score_quantiles`."""
     wire_field: str
     subkey: str | None
     horizons: tuple[int, ...]
@@ -319,8 +319,8 @@ def required_from_bundle(bundle_or_dir: Any, paired: Any = None, path: str = PAT
 
 # ── Warm-up, from the runtime's own constants ───────────────────────────────
 
-# Baked fallbacks, pinned to the code by an upstream validator test. Used only
-# where the runtime module is not importable (an edge machine with corpus/ alone).
+# Baked fallbacks, pinned to the code by tests/test_onboarding_validator.py. Used only
+# where the runtime module is not importable (a partner's machine with corpus/ alone).
 _FALLBACK = {"alpha": 0.0076, "n_horizons": 6, "floor_min": 200, "bank_reference": 200,
              "bank_scale": 100, "bank_calibration": 1500, "learned_ref": 60, "learned_min_live": 60,
              "learned_score_from": 100, "learned_tau_warmup": 96, "perf_ref": 60, "perf_post": 20,
@@ -416,7 +416,7 @@ _MODEL_KEYS = ("monitored_model_id", "model_id", "model", "model_name", "modelid
 _TS_KEYS = ("window_timestamp", "window_end", "timestamp", "ts", "time", "datetime", "date")
 _ENVELOPE_ONLY = {"tenant_id", "install_id", "window_id", "alert_ttl_seconds", "sdk_written_us",
                   "external_events", "outcome_labels", "z_t"}
-# Common telemetry columns that are not signal fields, with what they are NOT.
+# Common partner columns that are not signal fields, with what they are NOT.
 _HINTS = {
     "auc": "a model-quality metric is not a z_t field: the 17 fields are computed from per-record "
            "predictions (and features); see 'template'",
@@ -979,7 +979,7 @@ def analyse_model(model_id: str, rows: Sequence[WindowRow], *, required: Require
     optional = _check_optional(rows)
     if optional["external_events"]["malformed"]:
         block("external_events", f"{optional['external_events']['malformed']} malformed external_events item(s): "
-                                 "ingest rejects the window (schema_invalid)", "fix the event shape: see the external_events schema")
+                                 "ingest rejects the window (schema_invalid)", "fix the event shape: see docs/onboarding-validator.md")
     if optional["outcome_labels"]["malformed"]:
         block("outcome_labels", f"{optional['outcome_labels']['malformed']} malformed outcome_labels item(s)",
               "each label is {window_index>=0, n_labelled>=n_errors>=0}")
@@ -1187,7 +1187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     v.add_argument("files", nargs="+")
     v.add_argument("--json", action="store_true", help="machine-readable report on stdout")
     v.add_argument("--bundle", help="DIR with forecaster.pkl to derive the required fields from "
-                                    "(unpickles: trusted artifacts only). Default: the built-in reference bundle")
+                                    "(unpickles: trusted artifacts only). Default: the sandbox snapshot")
     v.add_argument("--paired-bundle", help="DIR with the learned detector's own forecaster.pkl; with "
                                            "--bundle, the learned-detector path is checked too")
     v.add_argument("--alpha", type=float, help="false-alarm level (default: the runtime's DEFAULT_ALPHA)")

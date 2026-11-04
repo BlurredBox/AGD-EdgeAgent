@@ -1,20 +1,20 @@
 """
 corpus/harness.py
 
-The replay harness.
+The replay harness (Phase 2 Task 4).
 
 Given a dataset and a trained base model, walks a time-ordered stream and at
 each window computes:
 
-  * the signal vector `z_t`, via corpus/signal_vector.py, which is
-    verified against the SHARED conformance fixtures (contracts/signal_vector/);
+  * Phase 1's signal vector `z_t`, via corpus/signal_vector.py, which is
+    verified against the SHARED conformance fixtures (corpus/conformance.py);
   * the TRUE performance metric, which is available here and nowhere else --
     in production there is no window-level ground truth, which is the entire
-    reason the performance estimator estimates it;
+    reason Phase 4 estimates it;
   * a provenance record, written at generation time because it cannot be
     reconstructed afterwards.
 
-No lookahead anywhere. Windows are cut on wall-clock boundaries at the contract's
+No lookahead anywhere. Windows are cut on wall-clock boundaries at Phase 1's
 cadence, and the true metric is computed over EXACTLY the rows that produced
 the vector -- misalignment between the two would be a silent label-noise
 source that no downstream check would catch.
@@ -36,22 +36,25 @@ from corpus.sketches import HyperLogLog, TDigest
 
 __all__ = ["DEFAULT_CADENCE_S", "ReferenceWindow", "ReplayHarness", "WindowResult"]
 
-# Default emission cadence, 5 minutes.
+# Phase 1 Task 8: default emission cadence, 5 minutes.
 DEFAULT_CADENCE_S = 300
 # 1.3: Group F host-ops scalars (inference_latency_p95/p99, cpu/gpu_utilization,
 # memory_headroom, request/timeout/exception/retry rate, queue_depth,
 # feed_staleness_s, host_anomaly_score, each with _valid) admitted on the wire.
-# Additive optional fields => MINOR (schema versioning rules). The harness
+# Additive optional fields => MINOR (phase-01-versioning.md §1). The harness
 # does not emit them; the stamp tracks the contract it conforms to.
-SCHEMA_VERSION = "1.3"
+# 1.4: leading-indicator scalars (G53: feature_null_rate_max, feature_null_over_ceiling_count,
+# arrival_lag_p50/p95/max_s, slice_count_scored, slice_shift_max, slice_count_over_limit;
+# `corpus/lead_signals.py`). Additive optional fields => MINOR. The harness does not emit them.
+SCHEMA_VERSION = "1.4"
 
 
 @dataclass
 class ReferenceWindow:
-    """The drift baseline: per-feature quantile sketches plus the raw reference
+    """Phase 1's baseline: per-feature quantile sketches plus the raw reference
     samples the PSI/JS/KS binning needs.
 
-    `reference_window_id` follows the contract's format so a consumer can join a
+    `reference_window_id` follows Task 3's format so a consumer can join a
     stored `z_t` back to the baseline it was computed against -- necessary
     because a re-baseline changes the meaning of every drift field without
     changing the schema.
@@ -72,11 +75,11 @@ class ReferenceWindow:
     cat_counts: dict[str, int] = field(default_factory=dict)
     # Exact value set for new_category_rate. Bounded by real categorical
     # cardinality; if a feature ever has unbounded cardinality this must
-    # become a sketch, and the contract's k=1 suppression already applies.
+    # become a sketch, and Phase 1's k=1 suppression already applies.
     cat_values: dict[str, frozenset] = field(default_factory=dict)
-    # Multivariate / anomaly / novelty state, fitted once per reference window. Refitting
+    # Phase 3 Tasks 2/3/5 state, fitted once per reference window. Refitting
     # per emission window would make every statistic compare against a moving
-    # target -- the error the univariate path avoids by caching bin edges.
+    # target -- the error Task 1 avoids by caching bin edges.
     multivariate: mv.MultivariateReference | None = None
     iforest: an.IsolationForestDetector | None = None
     hstrees: an.HalfSpaceTrees | None = None
@@ -111,7 +114,7 @@ class ReferenceWindow:
         cat_values = {f: frozenset(str(r.features[f]) for r in rows)
                       for f in categorical}
 
-        # --- detector state, all fitted once here
+        # --- Phase 3 detector state, all fitted once here
         import numpy as _np
         X = _np.array([[float(r.features[f]) for f in numeric] for r in rows])
         multivariate = mv.MultivariateReference.fit(X)
@@ -200,13 +203,13 @@ class ReplayHarness:
                      expected_rows: int, *,
                      reference_established: bool = True) -> dict:
         """Groups A, B, C, E, F. Group D is added by the caller when a true
-        metric exists; group G is ABSENT by construction (by design:
+        metric exists; group G is ABSENT by construction (Task 2:
         transmitted-not-consumed, so the corpus never contains it).
 
         `reference_established=False` emits the REFERENCE RAMP-UP form: the
         narrow vector a newly-onboarded model produces before it has a baseline
         to compare against. Every reference-dependent field is OMITTED, not
-        nulled -- the contract is explicit that the two ramp-ups must stay
+        nulled -- Phase 3 Task 7 s0 is explicit that the two ramp-ups must stay
         wire-distinguishable:
 
             absent      = this comparison does not exist yet
@@ -214,7 +217,7 @@ class ReplayHarness:
 
         Collapsing them would make a brand-new model indistinguishable from an
         established one having a quiet hour, and those need different responses
-        from both the forecaster and the operator. The forecaster's cold-start Stage 1
+        from both the forecaster and the operator. Phase 5's cold-start Stage 1
         trains on exactly this narrow form, so the corpus has to contain it.
         """
         z: dict = {"schema_version": SCHEMA_VERSION}
@@ -224,7 +227,7 @@ class ReplayHarness:
             z["reference_window_id"] = self.reference.reference_window_id
 
         if reference_established:
-            # A -- input space. ALL SIX univariate methods, always-on: the
+            # A -- input space. ALL SIX of Task 1's methods, always-on: the
             # vector's shape must not depend on load or on who is watching, or the
             # corpus and production emit different shapes for the same conditions.
             psi_map, js_map, ks_map = {}, {}, {}
@@ -264,7 +267,7 @@ class ReplayHarness:
             # new_category_rate measures whether they are the SAME values. A
             # category rename keeps the count identical and replaces every value,
             # so only the second field sees it -- which is precisely the
-            # integration-regression case the contract wants covered.
+            # integration-regression case Phase 1 wanted covered.
             card, new_rate = {}, {}
             for f in self.categorical:
                 vals = [str(r.features[f]) for r in bucket]
@@ -284,7 +287,7 @@ class ReplayHarness:
                       "score_skew": m["skew"], "score_kurtosis": m["kurtosis"]})
             # A collapsed model -- every row scored near-identically -- has no
             # distribution shape to report. score_moments returns None there
-            # rather than asserting zero skew, and the contract's tier-2 convention
+            # rather than asserting zero skew, and Phase 1's tier-2 convention
             # requires the companion flag alongside the null. Measured on an
             # MLP after schema_break renamed every category: max score 3.8e-07,
             # std 1.9e-08. That is a real production failure mode, not an edge
@@ -298,7 +301,7 @@ class ReplayHarness:
             }
             z["positive_decision_rate"] = sum(1 for s in scores if s >= 0.5) / len(scores)
         else:
-            # The contract's two-tier cannot-compute convention: null + explicit flag
+            # Phase 1's two-tier cannot-compute convention: null + explicit flag
             for k in ("score_mean", "score_std", "score_skew", "score_kurtosis",
                       "positive_decision_rate"):
                 z[k] = None
@@ -324,25 +327,25 @@ class ReplayHarness:
             z["ece"], z["ece_valid"] = None, False
 
         if reference_established:
-            # --- multivariate. Four of five return one scalar for
+            # --- Phase 3 Task 2: multivariate. Four of five return one scalar for
             # the whole vector; only the domain classifier attributes per feature,
-            # which is why the attribution rule makes it non-optional.
+            # which is why I-4 makes it non-optional.
             import numpy as _np
             Xw = _np.array([[float(r.features[f]) for f in self.numeric]
                             for r in bucket])
             mref = self.reference.multivariate
             z["pca_reconstruction_error"] = mv.pca_reconstruction_error(mref, Xw)
             z["mahalanobis_distance"] = mv.mahalanobis_mean(mref, Xw)
-            z["mahalanobis_method"] = "ledoit_wolf"      # provenance
+            z["mahalanobis_method"] = "ledoit_wolf"      # provenance (Phase 1 T3)
             z["covariance_delta"] = mv.covariance_delta(mref, Xw)
             z["top_eigenvalue_ratio"] = mv.top_eigenvalue_ratio(mref, Xw)
             z["mmd"] = mv.mmd_rbf(mref, Xw, seed=self.seed)
 
             dc = mv.domain_classifier(mref, Xw, seed=self.seed)
             if dc is None:
-                # Below the 200-row minimum. Multivariate attribution is
-                # absent, so the alert layer must not raise an unattributable
-                # multivariate alert on this window (attribution is mandatory).
+                # Below Task 7's 200-row minimum. Multivariate attribution is
+                # absent, so Phase 6 must not raise an unattributable
+                # multivariate alert on this window (I-4).
                 z["domain_classifier_drift"] = None
                 z["domain_classifier_drift_valid"] = False
                 z["domain_classifier_attribution"] = None
@@ -353,7 +356,7 @@ class ReplayHarness:
                     if i < len(self.numeric)}
             z["domain_classifier_family"] = "hist_gbm"   # provenance
 
-            # --- anomaly
+            # --- Task 3: anomaly
             if self.reference.iforest is not None:
                 ifs = self.reference.iforest.score(Xw)
                 z["if_anomaly_mean"] = ifs["mean"]
@@ -364,7 +367,7 @@ class ReplayHarness:
             hst = self.reference.hstrees
             z["hstrees_score"] = float(_np.mean([hst.score(r) for r in Xw]))
 
-            # --- novelty. Zero marginal cost -- reuses the two above.
+            # --- Task 5: novelty. Zero marginal cost -- reuses the two above.
             z["novelty_score"] = novelty_score(
                 z["mahalanobis_distance"], mref.mahalanobis_median,
                 z["pca_reconstruction_error"])
@@ -395,12 +398,12 @@ class ReplayHarness:
         `rampup_windows` emits that many REFERENCE RAMP-UP windows first: the
         structurally narrow vector a newly-onboarded model produces before it
         has a baseline. Reference-dependent fields are absent rather than null
-        (per the contract), and `warmup_state` records the stage.
+        (Phase 3 Task 7 s0), and `warmup_state` records the stage.
 
-        The forecaster's cold-start Stage 1 fits its GBT on exactly this narrow form,
+        Phase 5's cold-start Stage 1 fits its GBT on exactly this narrow form,
         so a corpus built with `rampup_windows=0` gives that stage nothing to
-        train on -- which is
-        the reason this parameter exists.
+        train on -- which is the gap `phase-05-cold-start.md` flagged as a
+        handoff to Phase 2 and the reason this parameter exists.
         """
         results: list[WindowResult] = []
         expected = max(1, int(self.cadence.total_seconds() /
@@ -410,7 +413,7 @@ class ReplayHarness:
             if injection is not None:
                 bucket = injection(list(bucket), w_idx)
             if len(bucket) < self.min_rows:
-                # Below the minimum emission bar -- no vector is emitted
+                # Below Phase 1's minimum emission bar -- no vector is emitted
                 # at all. Recording the skip keeps the gap visible.
                 results.append(WindowResult(
                     window_start=start.isoformat(), window_end=end.isoformat(),
@@ -424,7 +427,7 @@ class ReplayHarness:
             established = w_idx >= rampup_windows
             z = self._compute_z_t(bucket, scores, expected,
                                   reference_established=established)
-            # The cold-start stage, carried on every row so a consumer never
+            # coldstart-v1's stage, carried on every row so a consumer never
             # has to infer it from which fields happen to be present.
             z["warmup_state"] = "live" if established else "cold_start"
 

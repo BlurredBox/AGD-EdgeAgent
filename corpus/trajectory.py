@@ -1,13 +1,13 @@
 """
 corpus/trajectory.py
 
-The six trajectory operators, materialised into corpus rows.
+Phase 1 Task 4's six trajectory operators, materialised into corpus rows.
 
 The operators themselves live in corpus/signal_vector.py and are verified
 against the shared conformance fixtures. Until this module existed they were
 called by nothing except those fixtures -- true of the module, false of the
-corpus, which is the same defect class previously recorded for the detectors.
-`corpus/harness.py` emits per-window scalars; the forecaster's feature selection runs over
+corpus, which is the same defect class D-34 recorded for the detectors.
+`corpus/harness.py` emits per-window scalars; Phase 5's `fc-v1` selects over
 the OPERATOR-DERIVED fields, so without this pass the selection pool does not
 exist in any training row.
 
@@ -19,26 +19,26 @@ What this pass is:
   * strictly causal. The value at window `t` depends only on windows <= t.
     `test_no_lookahead` appends and rewrites later windows and asserts every
     earlier value is byte-identical;
-  * scoped per family, per the operator contract. The default
+  * scoped per family, per `phase-01-trajectory-operators.md` §2. The default
     of "all six on everything" is rejected there and rejected here.
 
 What it deliberately does NOT do:
 
   * tune an alert threshold. Operator 6 (time-above-threshold) needs a
     contract-fixed threshold per field. `THRESHOLDS` below now holds the
-    ones with a natural convention, each cited in `THRESHOLD_SOURCES`.
-    Slots without one stay `threshold_undeclared` in `coverage()`
+    ones with a natural convention, each cited in `THRESHOLD_SOURCES` (gap
+    G4). Slots without one stay `threshold_undeclared` in `coverage()`
     rather than being filled with a plausible number;
   * bridge a gap in the window sequence. A first difference across a
     ten-window hole is not a per-window rate, so it is `None`, not a number.
 
-NOTE: the threshold registry exists now, but the figures below are the pre-registry
-measurement and are kept as history; the threshold registry holds today's
-numbers.
+NOTE (G4): the registry exists now, but the figures below are the pre-registry
+measurement and are kept as history; `tests/test_trajectory_operators.py`
+holds today's numbers.
 
-Read `coverage()`'s numbers against the right base. The contract's total is **493**, of
-which **120 is group G** -- absent from this corpus by construction (by
-design), so no G slot is registered here and `spec_width` computes **373**,
+Read `coverage()`'s numbers against the right base. §4's total is **493**, of
+which **120 is group G** -- absent from this corpus by construction (Phase 2
+Task 2), so no G slot is registered here and `spec_width` computes **373**,
 the corpus-eligible remainder. Measured against that base, the shortfall is
 **219**, and `threshold_undeclared` is the SMALL part of it: 37 slots the
 harness does not emit at all, 4 struck by `EVT_EXCLUDED`, and 7 slots whose
@@ -53,7 +53,7 @@ from dataclasses import dataclass, field
 # NOTE: corpus.signal_vector is deliberately NOT imported here. The operators
 # are computed incrementally below so the pass stays single-traversal and can
 # enforce adjacency per window; signal_vector's series-at-a-time versions
-# remain the reference, and the upstream operator tests assert this
+# remain the reference, and tests/test_trajectory_operators.py asserts this
 # module agrees with them exactly. Reference and implementation are compared,
 # not shared -- which is what makes the comparison worth anything.
 
@@ -73,7 +73,7 @@ __all__ = [
     "merge_into_z",
 ]
 
-# EWMA half-life is 5 emission windows.
+# fc-v1 §2: EWMA half-life is 5 emission windows.
 HALF_LIFE_WINDOWS = 5
 
 OPERATORS = (
@@ -85,7 +85,7 @@ OPERATORS = (
     "time_above_threshold",  # 6
 )
 
-# The operator contract's family table, verbatim. Second derivative is excluded
+# phase-01-trajectory-operators.md §2, verbatim. Second derivative is excluded
 # from E and F (step-function metrics -- curvature is noise); time-above-
 # threshold is excluded from A, B and E (no contract-fixed threshold exists,
 # and encoding a tuning knob here would promote a tenant config value into a
@@ -103,16 +103,16 @@ FAMILY_OPERATORS: dict[str, tuple[str, ...]] = {
 
 @dataclass(frozen=True)
 class Slot:
-    """One operator-eligible field, per the contract's per-family enumeration.
+    """One operator-eligible field, per §4's per-family enumeration.
 
     `source` is the key `corpus/harness.py` emits, which is not always the
-    name the contract uses -- the divergences are recorded here rather than silently
+    name §4 uses -- the divergences are recorded here rather than silently
     renamed, because a slot that is present under another name and a slot that
-    is genuinely absent are different facts for the forecaster's pool size.
+    is genuinely absent are different facts for Phase 5's pool size.
 
     `kind`:
       scalar   -- read the value directly
-      map_mean -- the contract budgets map-valued statistics at ONE representative
+      map_mean -- §4 budgets map-valued statistics at ONE representative
                   aggregate slot each, "its stated `_aggregate` field where
                   one exists ... or, where none is named, the statistic's
                   single per-window summary value". No such summary is
@@ -132,7 +132,7 @@ def _s(name, fam, source=None, kind="scalar", subkey=None) -> Slot:
     return Slot(name, fam, source, kind, subkey)
 
 
-# The operator contract's slot list. Every slot the contract names is listed,
+# phase-01-trajectory-operators.md §4. Every slot the contract names is listed,
 # including the ones the harness does not yet emit (`source=None`) -- coverage()
 # reports those rather than this module pretending the pool is full width.
 SLOTS: tuple[Slot, ...] = (
@@ -148,12 +148,12 @@ SLOTS: tuple[Slot, ...] = (
     _s("new_category_rate", "A", "new_category_rate", "map_mean"),
     _s("out_of_training_range_fraction", "A", None, "map_mean"),
     _s("train_serve_skew_delta", "A", None, "map_mean"),
-    # The contract names this `covariance_delta_frobenius`; harness emits the same
+    # §4 names this `covariance_delta_frobenius`; harness emits the same
     # Frobenius quantity as `covariance_delta` (corpus/multivariate.py).
     _s("covariance_delta_frobenius", "A", "covariance_delta"),
     _s("top_eigenvalue_ratio", "A", "top_eigenvalue_ratio"),
     _s("pca_reconstruction_error", "A", "pca_reconstruction_error"),
-    # The contract names this `domain_classifier_auc`. The harness emits
+    # §4 names this `domain_classifier_auc`. The harness emits
     # `domain_classifier_drift`, which is the same detector's scalar output on
     # a different scale. Mapped, not invented; flagged in coverage().
     _s("domain_classifier_auc", "A", "domain_classifier_drift"),
@@ -186,7 +186,7 @@ SLOTS: tuple[Slot, ...] = (
     _s("nll", "C", "nll"),
     _s("refit_temperature", "C", None),
     _s("refit_temperature_drift", "C", None),
-    # ONE novelty field ships with a provenance companion; the contract's
+    # Phase 3 Task 5 ships ONE novelty field with a provenance companion; §4's
     # `epistemic_variance` slot is what it fills.
     _s("epistemic_variance", "C", "novelty_score"),
     _s("aleatoric_variance", "C", None),
@@ -211,7 +211,7 @@ SLOTS: tuple[Slot, ...] = (
     _s("null_propagation_depth", "E", None),
     # -- Group F, system and operational: 11 fields --------------------------
     # Emitted as cannot-compute by construction: replay has no real latency,
-    # and a design review makes EVT-derived fields an operational alarm
+    # and Phase 3's exit review makes EVT-derived fields an operational alarm
     # rather than a forecaster input while that stays true.
     _s("inference_latency_p50", "F", "inference_latency_p50"),
     _s("inference_latency_p95", "F", None),
@@ -224,22 +224,22 @@ SLOTS: tuple[Slot, ...] = (
     _s("memory_headroom", "F", None),
     _s("exception_rate", "F", None),
     _s("retry_rate", "F", None),
-    # -- Group G: ABSENT from the corpus by construction (by design:
+    # -- Group G: ABSENT from the corpus by construction (Phase 2 Task 2:
     # transmitted-but-not-consumed). No slots are registered, so the corpus
     # cannot accidentally grow a group G column.
 )
 
-# A binding constraint, carried into the pool the forecaster selects over:
+# Phase 3's binding constraint, carried into the pool that Phase 5 selects over:
 # EVT's output is an operational alarm, never a forecaster input, while the
-# corpus contains no real latency data. The feature-construction rule
+# corpus contains no real latency data. `phase-05-feature-construction.md` §3a
 # strikes EVT's own outputs AND the four group F streams EVT is fit on, before
 # selection runs -- so they must not be materialised as operator columns here
 # either. Leaving them in would put fabricated-or-absent values in front of
 # RFE, which could seat one of the 28.
 #
 # This is a CORPUS-SUPPORT exclusion, not a judgement that the fields are
-# uninformative. Re-entry is a corpus property -- the corpus carrying real
-# latency -- never a forecaster setting to flip.
+# uninformative. Re-entry is a Phase 2 property -- the corpus carrying real
+# latency -- never a Phase 5 setting to flip.
 EVT_EXCLUDED = frozenset({
     "inference_latency_p50",
     "inference_latency_p95",
@@ -247,12 +247,12 @@ EVT_EXCLUDED = frozenset({
     "request_rate",
 })
 
-# Operator 6's per-slot alert threshold (added 2026-10-14).
+# Operator 6's per-slot alert threshold (gap G4, closed 2026-10-14).
 #
 # Each value is FIXED FROM CONVENTION and cited in THRESHOLD_SOURCES. None was
 # tuned on any corpus, forecaster or detector result, and none may be: a
 # threshold changed after looking at a result is a tuning knob promoted into a
-# schema constant, which is what the operator contract forbids.
+# schema constant, which is what phase-01-trajectory-operators.md §2 forbids.
 # Changing one is a contract change (new corpus build, invalidates built
 # corpora), not a config edit. Per-tenant SLOs belong in tenant config.
 #
@@ -290,20 +290,20 @@ THRESHOLD_SOURCES: dict[str, str] = {
 }
 
 # Slots that have a natural threshold but whose FAMILY excludes operator 6
-# (the operator contract: A, B and E). Recorded so the decision
+# (phase-01-trajectory-operators.md §2: A, B and E). Recorded so the decision
 # is visible, NOT used by expand()/coverage(): enabling operator 6 for A/E
 # changes the spec width (373) and the closed wire schema, so it is a
 # separate contract amendment.
 #   psi                    A  0.10 / 0.25 industry PSI bands (<0.1 stable,
-#                             0.1-0.25 moderate, >0.25 major); the static baseline
+#                             0.1-0.25 moderate, >0.25 major); baselines-v1 §1
 #                             uses 0.20 per feature.
 #   row_count_vs_expected  E  two-sided band [0.5, 2.0]
-#                             (data-quality check #8);
+#                             (PLAN/answers/phase-03-data-quality-checks.md #8);
 #                             "above" is the wrong shape for it.
 #   feature_store_staleness / upstream_freshness_lag: contract rule is
 #                             relative (3x reference median lag), no fixed value.
 #   feed_staleness_s       (new wire scalar, no slot): no convention for a
-#                             fixed number; the edge tripwire owns it.
+#                             fixed number; the v4 tripwire owns it.
 FAMILY_EXCLUDED_CONVENTIONS: dict[str, str] = {
     "psi": "0.10 / 0.25 PSI bands",
     "row_count_vs_expected": "band [0.5, 2.0]",
@@ -316,7 +316,7 @@ class Coverage:
     """Measured, not asserted: how much of the operator pool a given corpus
     build actually materialises.
 
-    `spec_width` is the CORPUS-ELIGIBLE spec -- the contract's 493 minus its 120-wide
+    `spec_width` is the CORPUS-ELIGIBLE spec -- §4's 493 minus its 120-wide
     group G, which this corpus never carries -- so it comes to 373. Comparing
     `materialised_width` against 493 would charge this build for a group it is
     specified not to have.
@@ -336,7 +336,7 @@ class Coverage:
 
 
 def coverage(slots: Sequence[Slot] = SLOTS) -> Coverage:
-    """Width arithmetic against the contract, computed rather than quoted."""
+    """Width arithmetic against §4, computed rather than quoted."""
     cov = Coverage()
     for s in slots:
         ops = FAMILY_OPERATORS[s.family]
@@ -405,7 +405,7 @@ class _SlotState:
     `ewma_abs_change` all describe a per-window rate, so they are emitted only
     when the windows they span are consecutive AND valid. A difference taken
     across a hole in the stream is not a rate, and `None` is the honest value
-    for it -- the same reasoning applied to ramp-up.
+    for it -- the same reasoning Phase 3 Task 7 applies to ramp-up.
 
     `ewma` and `time_above_threshold` are defined over the valid history rather
     than over an adjacent pair, so they survive a gap and carry their state

@@ -15,7 +15,7 @@ What is reused, and how
   `corpus.trading_signals.compute_trading_signals`, per instrument.
 * Trajectory operators: `corpus.trajectory._SlotState` driven by the same
   per-window loop as `trajectory.expand`, so state is incremental (`expand`
-  takes a whole series). `tests/edge_agent/test_reference_conformance.py`
+  takes a whole series). `tests/edge_agent/test_trajectory_incremental.py`
   asserts the two agree exactly.
 """
 from __future__ import annotations
@@ -34,6 +34,7 @@ import numpy as np
 
 from corpus import signal_vector as sv
 from corpus import trading_signals as tr
+from corpus import lead_signals as lead
 from corpus import trajectory as traj
 from corpus.adapters import Row
 from corpus.harness import ReferenceWindow, ReplayHarness
@@ -69,6 +70,7 @@ class ModelSignals:
         self.cfg, self.model_id, self.wire_model_id = cfg, model_id, wire_model_id
         self.prices, self.alerter, self.state_path = prices, alerter, state_path
         self.n_ref_windows = 0
+        self.last_gate_failures: list[str] = []      # the last window's quality-gate failures (agent counts them)
         self.ref_rows: list[tuple[datetime, dict[str, Any]]] = []
         self.ref_rows_seen = 0
         self.ref_window_sizes: list[int] = []
@@ -80,13 +82,17 @@ class ModelSignals:
         self.categorical: list[str] = []
         self.rolling: dict[str, tr.RollingState] = {}
         self.slot_state = {s.name: traj._SlotState() for s in _LIVE_SLOTS}
+        # G53 slice shift: per-slice (n, sum of outputs) over the reference windows, and the reference
+        # output sd. Slice keys are partner values: local state only, never on the wire.
+        self.ref_slice_acc: dict[str, list[float]] = {}
+        self.ref_output_sd: float | None = None
         self._rng = random.Random(cfg.seed)
         self._load()
 
     # -- persistence (local only; raw reference rows live on the partner's disk) ----
     _PERSIST = ("n_ref_windows", "ref_rows", "ref_rows_seen", "ref_window_sizes",
                 "ref_outputs", "ref_volumes", "reference", "stats", "numeric",
-                "categorical", "rolling", "slot_state")
+                "categorical", "rolling", "slot_state", "ref_slice_acc", "ref_output_sd")
 
     def _load(self) -> None:
         try:
@@ -117,7 +123,8 @@ class ModelSignals:
         win, cfg = wi.window, self.cfg
         recs = win.records
         if len(recs) < cfg.min_rows_per_window:
-            return None                       # minimum emission bar: no vector at all
+            return None                       # Phase 1's minimum emission bar: no vector at all
+        received = list(recs)                 # before the completeness filter: null rates need them
 
         if self.live:        # rows with a missing numeric value cannot enter the detectors
             usable = [r for r in recs if self._complete(r)]
@@ -157,12 +164,39 @@ class ModelSignals:
             z["row_count_vs_expected"] = sv.row_count_ratio(len(recs), self.stats.expected_rows)
         if ops_provider is not None:
             z.update(ops_provider(self.model_id, win) or {})   # optional host-ops hook
+        z.update(self._lead_indicators(received))
 
         z.update(self._trajectory(win.index, z))
 
         if not self.live:
             self._accumulate_reference(win, recs)
         return z
+
+    # -- G53 leading indicators (counts, rates, lags; corpus/lead_signals.py) ----------
+    def _slice_key(self, r) -> str | None:
+        v = r.features.get(self.cfg.slice_feature)
+        return None if lead.is_null(v) else str(v)
+
+    def _lead_indicators(self, recs) -> dict[str, Any]:
+        cfg, st = self.cfg, self.stats
+        cols = st.expected_schema if st and st.expected_schema else {c for r in recs for c in r.features}
+        out: dict[str, Any] = dict(lead.null_summary([r.features for r in recs], sorted(cols),
+                                                     cfg.null_rate_ceiling))
+        out.update(lead.arrival_lags(
+            (r.ts.timestamp(), None if r.arrived_at is None else r.arrived_at.timestamp()) for r in recs))
+        if cfg.slice_feature and self.live:
+            acc: dict[str, list[float]] = {}
+            for r in recs:
+                k = self._slice_key(r)
+                if k is not None and k in self.ref_slice_acc and math.isfinite(r.output):
+                    a = acc.setdefault(k, [0, 0.0])
+                    a[0] += 1
+                    a[1] += r.output
+            window = {k: (int(n), sm / n) for k, (n, sm) in acc.items()}
+            ref = {k: (int(n), sm / n) for k, (n, sm) in self.ref_slice_acc.items() if n}
+            out.update(lead.slice_shift(window, ref, self.ref_output_sd, cfg.slice_min_rows,
+                                        cfg.slice_shift_limit))
+        return out
 
     # -- quality gate -----------------------------------------------------------
     def _quality_gate(self, win: ClosedWindow, recs, dropped_fraction: float) -> bool:
@@ -181,6 +215,7 @@ class ModelSignals:
         failures = list(rep.structural_failures)
         if dropped_fraction > self.cfg.max_invalid_row_fraction:
             failures.append("ingest_degraded")
+        self.last_gate_failures = failures
         if failures:
             self.alerter.raise_alert(
                 REJECTED, self.model_id,
@@ -312,6 +347,16 @@ class ModelSignals:
                 if j < cap:
                     self.ref_rows[j] = item
         self.ref_outputs += [r.output for r in recs if math.isfinite(r.output)]
+        if self.cfg.slice_feature:
+            for r in recs:
+                k = self._slice_key(r)
+                if k is None or not math.isfinite(r.output):
+                    continue
+                if k not in self.ref_slice_acc and len(self.ref_slice_acc) >= self.cfg.slice_max:
+                    continue                       # bounded: further slice values are not scored
+                a = self.ref_slice_acc.setdefault(k, [0, 0.0])
+                a[0] += 1
+                a[1] += r.output
         self.ref_outputs = self.ref_outputs[-200_000:]
         self.ref_window_sizes.append(len(recs))
         self.n_ref_windows += 1
@@ -341,6 +386,7 @@ class ModelSignals:
         sizes = sorted(self.ref_window_sizes)
         outs = np.asarray(self.ref_outputs, dtype=float)
         rms = float(np.sqrt(np.mean(outs ** 2))) if len(outs) else None
+        self.ref_output_sd = float(np.std(outs)) if len(outs) > 1 else None
         vol = float(np.mean(self.ref_volumes)) if self.ref_volumes else None
         self.stats = ReferenceStats(
             expected_schema=cols, expected_dtypes=dtypes, reference_categories=cats,

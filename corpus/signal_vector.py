@@ -1,16 +1,16 @@
 """
 corpus/signal_vector.py
 
-Signal-vector (`z_t`) computation for the replay harness.
+Signal-vector (`z_t`) computation for the Phase 2 replay harness.
 
 THIS MODULE IS VERIFIED AGAINST contracts/signal_vector/runner.py's fixtures.
 It is not a second implementation of the wire contract -- it is *an*
 implementation whose conformance is proven by running the shared suite, which
-is exactly the mechanism the contract chose,
-and which requires this
+is exactly the mechanism Phase 1 Task 9 chose (see
+PLAN/answers/phase-01-conformance-suite.md) and which Phase 2 §3 requires this
 harness to consume rather than substitute.
 
-Run the conformance check to verify. CI must treat a
+Run `python3 -m corpus.conformance` to verify. Phase 2's CI must treat a
 non-zero exit from that command as a build failure.
 
 Every formula below mirrors the reference implementation in the conformance
@@ -26,8 +26,8 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-# Vectorisation note (2026-08-15). The functions below were
-# originally written against plain Python sequences. Measured on the edge
+# Vectorisation note (Phase 8, 2026-08-15). The functions below were
+# originally written against plain Python sequences. Measured on the Phase 8
 # target, converting a window to Python lists cost ~180 MB at 100k rows --
 # the single largest per-model line item in the edge memory budget -- and the
 # per-bin scan in `bin_counts` plus the 15-pass bucket scan in `ece`/`mce`
@@ -36,12 +36,12 @@ import numpy as np
 #
 # What changed: the data representation, and nothing else. Every formula,
 # every binning policy, every tie-break and boundary convention is preserved
-# exactly, because the contract is explicit that a
+# exactly, because `phase-03-univariate-drift.md` §0 is explicit that a
 # formula change bumps the schema version and invalidates the corpus. The
-# equivalence is PROVEN, not asserted: a golden-output script pins
+# equivalence is PROVEN, not asserted: `scripts/phase8_golden.py` pins
 # full-precision output over an edge-case battery (empty, constant, ties,
 # outliers, single-value, wide-range) and is diffed before/after, alongside
-# the conformance check and the shared contract runner.
+# `corpus/conformance.py` and the shared contract runner.
 #
 # The public signatures still accept any Sequence/Iterable, so callers that
 # pass lists keep working -- they simply no longer force a list round-trip
@@ -143,7 +143,7 @@ def js_divergence(reference_window: Sequence[float], current_window: Sequence[fl
                   ref_counts: Sequence[int] | None = None) -> float:
     """Jensen-Shannon divergence, log base 2, over the same bins PSI uses.
 
-    Base 2 and shared binning are both fixed by the field contract so that
+    Base 2 and shared binning are both fixed by phase-01-fields.md so that
     JS and PSI are comparable and bounded in [0, 1].
     """
     if edges is None:
@@ -201,7 +201,7 @@ def wasserstein1(reference_window, current_window) -> float:
     subsampling, no interpolation onto a common grid.
 
     UNITS: same as the feature. That makes it interpretable but NOT
-    comparable across features, which is why the contract keeps it per-feature and
+    comparable across features, which is why Phase 1 keeps it per-feature and
     never aggregates it the way it aggregates PSI.
     """
     a = np.sort(np.asarray(reference_window, dtype=float))
@@ -320,7 +320,7 @@ def score_moments(scores: Sequence[float]) -> dict[str, float | None]:
     # a claim about a distribution that carries no shape at all, and exactly
     # the "plausible arithmetic that corresponds to nothing" this project has
     # caught repeatedly. None means "exists, could not be computed", which is
-    # the contract's tier-2 convention and what the caller must emit as
+    # Phase 1's tier-2 convention and what the caller must emit as
     # null + _valid=false.
     #
     # Guarding on `std ** 3` rather than `std` is deliberate. A model that has
@@ -349,7 +349,7 @@ def _calibration_buckets(pairs, bins: int):
     """Per-bucket mean confidence, accuracy and count for ECE/MCE.
 
     Both metrics ran the same 15 full passes over the window, each rebuilding
-    a Python list -- 2.5 s per window per model at 100k rows on the edge
+    a Python list -- 2.5 s per window per model at 100k rows on the Phase 8
     target, the largest single CPU line item measured. One vectorised
     bucketing serves both.
 
@@ -461,7 +461,7 @@ def fit_temperature(logits_or_probs: Sequence[float], labels: Sequence[int],
     Vectorised over the sample axis, looped over the temperature grid.
 
     **Profiled 2026-08-23** at the reference-window bar (`N = 2000`), which
-    an earlier review named but left unmeasured: this function was
+    `phase-08-exit-review.md` named but left unmeasured: this function was
     **96.9% of the entire calibration family** -- 86.4 ms of 89.1 ms, from
     200,000 `math.exp` and 402,000 `math.log` calls. The grid is 100 points
     and the inner loop ran once per sample per point, in Python.
@@ -488,14 +488,14 @@ def fit_temperature(logits_or_probs: Sequence[float], labels: Sequence[int],
     smallest temperature wins by accident.
 
     It is worth not preserving. `T = 0.05` means `p ** (1/0.05)` = `p**20`,
-    and the server-side scoring engine carries a load-bearing comment about exactly
-    this failure: a fitted `T` of 0.084 amplified the score to
+    and `src/core/engine.py` carries a load-bearing comment about exactly
+    this failure: a fitted `T` of 0.084 amplified the pilot-mode score to
     the zero rail, "measured 0.3775 raw collapsing to 0.0026 against a 0.85
-    alert threshold, i.e. the mode could not raise an alert under any
+    alert threshold, i.e. pilot mode could not raise an alert under any
     input whatsoever". Returning the identity temperature on no evidence is
     the safe answer; returning the most extreme one on the grid is not.
 
-    Unreachable in the shipped path -- the contract puts the reference-window
+    Unreachable in the shipped path -- Phase 1 §5 puts the reference-window
     bar at `N >= 2000` -- so this changes no corpus value. Recorded because
     the module's own rule is that a formula change bumps the schema
     version, and a silent one would breach it even where the input cannot
@@ -521,7 +521,7 @@ def fit_temperature(logits_or_probs: Sequence[float], labels: Sequence[int],
 def apply_temperature(probs: Sequence[float], t: float) -> list[float]:
     """Calibrated stream. The raw scores are NEVER modified in place --
     calibration is a parallel product, because compressing the confidence gap
-    is exactly what removes the forecaster's signal."""
+    is exactly what removes Phase 5's signal (Task 4 §0)."""
     out = []
     for p in probs:
         pc = min(max(p, 1e-7), 1 - 1e-7)
@@ -533,7 +533,7 @@ def apply_temperature(probs: Sequence[float], t: float) -> list[float]:
 def predictive_entropy(p: float) -> float:
     """Binary predictive entropy in bits. Total uncertainty of ONE prediction.
 
-    Not a decomposition and not labelled as one.
+    Not a decomposition and not labelled as one (Task 5).
     """
     pc = min(max(p, 1e-12), 1 - 1e-12)
     return -(pc * math.log2(pc) + (1 - pc) * math.log2(1 - pc))
@@ -546,8 +546,8 @@ def predictive_entropy(p: float) -> float:
 def ci_width(p_hat: float, n: int) -> float:
     """Full width of the two-sided 95% normal-approximation interval.
 
-    3.92 = 2 * 1.96. At the reference reservoir N = 2000 and worst-case p = 0.5
-    this gives ~0.0438, which is the bound the field contract commits to.
+    3.92 = 2 * 1.96. At Phase 1's reservoir N = 2000 and worst-case p = 0.5
+    this gives ~0.0438, which is the bound phase-01-fields.md commits to.
     """
     return 3.92 * math.sqrt(p_hat * (1 - p_hat) / n)
 
@@ -572,11 +572,11 @@ def percentile_linear(sample: Sequence[float], p: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Trajectory operators
+# Trajectory operators (Phase 1 Task 4)
 # ---------------------------------------------------------------------------
-# These are where the design's central claim lives: temporal structure is
-# carried by these operators rather than by a recurrent encoder.
-# Each shortens the series, which is why insufficient-history handling
+# These are where the plan's central claim lives: temporal structure is
+# carried by these operators rather than by a recurrent encoder (Invariant
+# I-2). Each shortens the series, which is why insufficient-history handling
 # is explicit rather than implicit.
 
 def first_difference(series: Sequence[float]) -> list[float]:
