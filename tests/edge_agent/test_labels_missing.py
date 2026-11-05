@@ -15,6 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+pytest.importorskip("demo_seed_lib")        # server-side seed library: absent in the public edge repo
 from demo_seed_lib import catalog  # noqa: E402
 from demo_seed_lib.generator import state_at, window_rows  # noqa: E402
 from edge_agent.agent import EdgeAgent  # noqa: E402

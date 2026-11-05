@@ -1,5 +1,5 @@
 <#
- BlurredBox edge agent: one-command installer for Windows Server. NOT TESTED on real Windows (Arameh owns Windows runs).
+ BlurredBox edge agent: one-command installer for Windows Server. NOT TESTED on real Windows.
 
    powershell -ExecutionPolicy Bypass -File .\installer\windows\install.ps1 [-NoSetup] [-Uninstall] [-Python C:\Python312\python.exe] `
        [-- setup flags: --console-url ... --tenant-id ... (same as `blurredbox-edge setup`)]

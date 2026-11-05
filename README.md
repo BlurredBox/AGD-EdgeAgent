@@ -2,11 +2,22 @@
 
 The BlurredBox Edge Agent is a small program that you run on your own machine, next to your machine learning model. It watches how your model behaves and works out short summaries of that behaviour on your side.
 
-Your raw data stays with you. The agent runs on your infrastructure, and only the summaries it produces are sent to the BlurredBox service. Your inputs, predictions and other raw records never leave your environment.
+Your raw data stays with you. The agent runs on your infrastructure and sends BlurredBox only per-window summary statistics: score quantiles (the 1st to 99th percentile of the model's outputs for the window) and per-feature drift statistics under hashed feature ids. Individual records, raw feature values, feature names, logs and prices are not sent. A model's score distribution is, however, what the quantiles describe, so treat the summaries as derived from your predictions, not as unrelated to them.
+
+## What leaves your network
+
+- Signed HTTPS posts of the summary statistics, to the endpoints in your config (`/api/v1/ingest/signal`).
+- Optional, off by default: if you set `instrument_series`, the agent downloads public daily closes from `fred.stlouisfed.org` (one request per series per refresh). That tells FRED which series you follow.
+
+Nothing else is sent. The code that assembles a payload is `edge_agent/wire.py`; `tests/edge_agent/test_wire_audit.py` checks it for leaks.
+
+## Platform
+
+Linux (systemd or the container image) is the supported platform. The Windows service wrapper under `packaging/edge_agent/installer/windows/` is untested and not offered; on Windows the owner-only file modes are not enforced.
 
 ## Status
 
-Early stage and under active development. This repository mirrors the edge agent from BlurredBox release `v0.0.2-rc6` (agent version 0.1.3). Some modules and tests import server code that is not in this repository, so not every test runs from a clean clone.
+Early stage. This repository mirrors the edge agent from BlurredBox release `v0.0.2-rc6` (agent version 0.1.3) with `scripts/release_from_agd.py`. The agent needs the BlurredBox SDK (`blurredbox_agd`), which is not on a public index; without it, and without the server code some tests import, those tests skip. To report a security problem see `SECURITY.md`.
 
 ## Install
 

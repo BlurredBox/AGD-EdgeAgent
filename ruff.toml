@@ -1,0 +1,12 @@
+# Same rules BlurredBox applies to this code in its own CI (default rule set, same ignores); mirrored files are
+# checked as they are, not reformatted here.
+[lint]
+ignore = [
+    "E402",  # imports after sys.path / environment setup are intentional
+    "E701",  # one-line statements in legacy code
+    "E741",  # ambiguous variable names in legacy code
+    "E712",  # comparison to True/False
+]
+
+[lint.per-file-ignores]
+"tests/**" = ["F811", "E702"]
