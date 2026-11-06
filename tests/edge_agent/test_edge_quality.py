@@ -55,20 +55,7 @@ def test_feature_ids_survive_a_corrupt_file_through_the_backup(tmp_path):
     before = FeatureIdMap(path).id_for("price")
     path.write_text('{"salt": "00')                      # half-written
     again = FeatureIdMap(path)
-    assert again.id_for("price") == before and not again.salt_regenerated
-
-
-def test_losing_every_copy_is_flagged_and_alerted_not_silent(tmp_path):
-    cfg = make_cfg(tmp_path)
-    EdgeAgent(cfg, post=Collector()).close()
-    ids = cfg.state_dir / "feature_ids.json"
-    ids.write_text("garbage")
-    ids.with_suffix(".bak").write_text("garbage")
-    agent = EdgeAgent(cfg, post=Collector())
-    assert agent.ids.salt_regenerated
-    assert any("feature ids" in a.message or "feature id" in a.message for a in agent.alerter.history)
-    assert list(cfg.state_dir.glob("feature_ids.corrupt-*"))
-    agent.close()
+    assert again.id_for("price") == before
 
 
 # -- F15 ------------------------------------------------------------------------------------------

@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from edge_agent.transport import _NOT_QUEUES
+
 STATUS_FILE = "status.json"
 
 
@@ -33,7 +35,7 @@ def _spool(root: Path, now: float) -> dict[str, Any]:
     models: dict[str, Any] = {}
     total = 0
     if root.is_dir():
-        for d in sorted(p for p in root.iterdir() if p.is_dir() and p.name not in ("rejected", "replayed")):
+        for d in sorted(p for p in root.iterdir() if p.is_dir() and p.name not in _NOT_QUEUES):
             files = sorted(d.glob("*.json"))
             total += len(files)
             oldest = min((f.stat().st_mtime for f in files), default=None)

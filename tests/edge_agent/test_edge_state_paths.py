@@ -30,7 +30,8 @@ def test_jsonl_rotation_resumes_at_the_start_of_the_new_file(tmp_path):
     assert [r.features["x"] for r in got] == [4.0]
 
 
-@pytest.mark.parametrize("name", ["open_windows.json", "emitted.json", "feature_ids.json", "status.json"])
+# feature_ids.json is not here: a damaged salt refuses the start (F25, test_salt_and_dirs_f25.py)
+@pytest.mark.parametrize("name", ["open_windows.json", "emitted.json", "status.json"])
 def test_agent_starts_over_a_corrupt_state_file(tmp_path, name):
     cfg = make_cfg(tmp_path)
     cfg.state_dir.mkdir(parents=True)

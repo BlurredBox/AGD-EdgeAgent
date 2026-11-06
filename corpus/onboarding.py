@@ -299,17 +299,18 @@ def default_required(path: str = "all") -> RequiredSpec:
     return merge_required(live, learned)
 
 
-def required_from_bundle(bundle_or_dir: Any, paired: Any = None, path: str = PATH_LIVE) -> RequiredSpec:
+def required_from_bundle(bundle_or_dir: Any, paired: Any = None, path: str = PATH_LIVE, *,
+                         sha256: str | None = None, paired_sha256: str | None = None) -> RequiredSpec:
     """Derive the list from a `ForecasterBundle` (or a directory holding
     `forecaster.pkl`). With `paired` (the learned detector's own forecaster), the union
-    of both paths. Unpickling executes code: only point this at an artifact you
-    built or were handed by BlurredBox."""
+    of both paths. A directory argument is unpickled only via `load_pinned_bundle`, so it needs
+    the pinned `sha256` (`paired_sha256` for `paired`); without it this raises (audit F20)."""
     if paired is not None:
-        return merge_required(required_from_bundle(bundle_or_dir),
-                              required_from_bundle(paired, path=PATH_LEARNED))
+        return merge_required(required_from_bundle(bundle_or_dir, sha256=sha256),
+                              required_from_bundle(paired, path=PATH_LEARNED, sha256=paired_sha256))
     if isinstance(bundle_or_dir, (str, Path)):
         p = Path(bundle_or_dir)
-        bundle = pickle.loads((p / "forecaster.pkl").read_bytes())  # trusted artifact
+        bundle = load_pinned_bundle(p, sha256)
         src = f"bundle {p.name}"
     else:
         bundle, src = bundle_or_dir, ("learned-detector forecaster bundle" if path == PATH_LEARNED

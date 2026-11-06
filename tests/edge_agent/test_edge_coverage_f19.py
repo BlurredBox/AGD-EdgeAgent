@@ -23,6 +23,7 @@ def test_a_window_queued_past_the_offline_limit_is_dropped_not_sent(tmp_path):
     assert agent.sender.pending_count() >= 1
     sent_before = len(sink.bodies())
     clock[0] = utc(T0 + 34 * 86400)
+    agent.sender._wall_vouched = True                # F24: expiry needs an accepted send this run
     agent.sender.drain(force=True)
     assert agent.sender.stats.expired >= 1
     assert agent.sender.pending_count() == 0

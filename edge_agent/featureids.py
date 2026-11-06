@@ -20,6 +20,10 @@ import time
 from pathlib import Path
 
 
+class FeatureIdSaltError(RuntimeError):
+    """feature_ids.json and its .bak both exist but neither can be read."""
+
+
 class FeatureIdMap:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -30,11 +34,12 @@ class FeatureIdMap:
 
     def _load(self) -> None:
         """Read the salt. An id is HMAC(salt, name), so the salt is what must never change: a file that
-        exists but cannot be parsed is kept aside (`.corrupt-<time>`), the backup copy (`.bak`) is tried, and only if
-        both fail is a new salt made, flagged in `salt_regenerated` so the agent can alert."""
-        self.salt_regenerated = False
+        exists but cannot be parsed is kept aside (`.corrupt-<time>`) and the backup copy (`.bak`) is tried. If
+        neither parses the agent refuses to start (new ids would restart every server-side series); a new salt
+        is made only when neither file exists, i.e. on the first start."""
         damaged = False
-        for candidate in (self.path, self.path.with_suffix(".bak")):
+        bak = self.path.with_suffix(".bak")
+        for candidate in (self.path, bak):
             try:
                 text = candidate.read_text()
             except FileNotFoundError:
@@ -54,12 +59,15 @@ class FeatureIdMap:
                 self._save()
             return
         if damaged:
-            self.salt_regenerated = True
-            if self.path.exists():
-                try:
-                    os.replace(self.path, self.path.with_name(f"{self.path.stem}.corrupt-{int(time.time())}"))
-                except OSError:
-                    pass
+            kept = self.path.with_name(f"{self.path.stem}.corrupt-{int(time.time())}")
+            try:
+                os.replace(self.path, kept)
+            except OSError:
+                kept = self.path if self.path.exists() else bak
+            raise FeatureIdSaltError(
+                f"the feature-id salt is damaged: {self.path} and its backup {bak} cannot be read (the damaged "
+                f"file is kept as {kept}). Restore a good copy of both, or delete {self.path} and {bak} to accept "
+                "new feature ids (every feature id changes and server-side per-feature series restart).")
         self._salt = secrets.token_bytes(32)
         self._save()
 
