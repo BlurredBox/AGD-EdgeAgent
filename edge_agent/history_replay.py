@@ -604,7 +604,9 @@ def replay(spec: ReplaySpec, staged: Mapping[str, Any], *, tenant_id: str, insta
     sim0, wall0, last_note = clock.now, time.monotonic(), time.monotonic()
     try:
         while True:
-            n = agent.poll()
+            read = adapter.rows_delivered
+            agent.poll()
+            read = adapter.rows_delivered - read      # rows read, good or bad: 0 only at the end of the history
             agent.tick(clock.now)
             if speed:
                 ahead = (clock.now - sim0).total_seconds() / speed - (time.monotonic() - wall0)
@@ -613,7 +615,7 @@ def replay(spec: ReplaySpec, staged: Mapping[str, Any], *, tenant_id: str, insta
             if progress and time.monotonic() - last_note > 30:
                 last_note = time.monotonic()
                 progress(f"replayed to {clock.now.isoformat()} sent={agent.sender.stats.sent}")
-            if n == 0:
+            if read == 0:
                 break
         agent.flush()
         for _ in range(50):                       # retryable failures stay queued: drain them in order

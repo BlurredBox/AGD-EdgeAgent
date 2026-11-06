@@ -317,6 +317,25 @@ def required_from_bundle(bundle_or_dir: Any, paired: Any = None, path: str = PAT
     return derive_required({h: list(bundle.features_by_horizon[h]) for h in bundle.horizons}, src, path)
 
 
+def load_pinned_bundle(directory: str | Path, sha256: str | None) -> Any:
+    """Unpickle `<directory>/forecaster.pkl` only if its SHA-256 equals the digest the operator pinned.
+
+    The digest comes from BlurredBox out of band; the bytes checked are the bytes unpickled (audit F20)."""
+    import hashlib
+    import hmac
+    if (sha256 is None or len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256)):
+        raise ValueError("a lowercase SHA-256 digest of forecaster.pkl is required for each bundle "
+                         "(--bundle-sha256 / --paired-bundle-sha256)")
+    raw = (Path(directory) / "forecaster.pkl").read_bytes()
+    if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), sha256):
+        raise ValueError("bundle digest mismatch: forecaster.pkl is not the artifact the digest names")
+    bundle = pickle.loads(raw)  # noqa: S301 -- digest-pinned operator artifact
+    from corpus.forecaster import ForecasterBundle
+    if not isinstance(bundle, ForecasterBundle):
+        raise ValueError("pinned artifact is not a ForecasterBundle")
+    return bundle
+
+
 # ── Warm-up, from the runtime's own constants ───────────────────────────────
 
 # Baked fallbacks, pinned to the code by tests/test_onboarding_validator.py. Used only
@@ -327,33 +346,38 @@ _FALLBACK = {"alpha": 0.0076, "n_horizons": 6, "floor_min": 200, "bank_reference
              "ext_samples": 288}
 
 
+def _log_fallback() -> None:
+    import logging
+    logging.getLogger(__name__).debug("runtime constant unavailable; using the baked fallback", exc_info=True)
+
+
 def _runtime_constants() -> dict[str, Any]:
     c = dict(_FALLBACK)
     try:
         from src.core.forecasters import forecaster_service as fs
         c["alpha"], c["n_horizons"] = fs.DEFAULT_ALPHA, fs.N_HORIZONS
     except Exception:
-        pass
+        _log_fallback()
     try:
         from src.policy.forecast import learned_detector as ld
         c.update(learned_ref=ld.REF_WINDOWS, learned_min_live=ld.MIN_LIVE, learned_score_from=ld.SCORE_FROM)
     except Exception:
-        pass
+        _log_fallback()
     try:
         from src.policy.forecast.tau_calibration import CalibrationConfig
         c["learned_tau_warmup"] = CalibrationConfig().warmup_windows
     except Exception:
-        pass
+        _log_fallback()
     try:
         from src.policy.forecast.perf_monitor import PerfConfig
         c.update(perf_ref=PerfConfig().ref_windows, perf_post=PerfConfig().min_post_labels)
     except Exception:
-        pass
+        _log_fallback()
     try:
         from src.api import signal_runtime as sr
         c["bank_calibration"] = sr.DEFAULT_BANK_CALIBRATION
     except Exception:
-        pass
+        _log_fallback()
     return c
 
 
@@ -1188,16 +1212,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     v.add_argument("--json", action="store_true", help="machine-readable report on stdout")
     v.add_argument("--bundle", help="DIR with forecaster.pkl to derive the required fields from "
                                     "(unpickles: trusted artifacts only). Default: the sandbox snapshot")
+    v.add_argument("--bundle-sha256", help="SHA-256 of forecaster.pkl (required with --bundle)")
     v.add_argument("--paired-bundle", help="DIR with the learned detector's own forecaster.pkl; with "
                                            "--bundle, the learned-detector path is checked too")
+    v.add_argument("--paired-bundle-sha256", help="SHA-256 of the paired forecaster.pkl")
     v.add_argument("--alpha", type=float, help="false-alarm level (default: the runtime's DEFAULT_ALPHA)")
     v.add_argument("--cadence-minutes", type=float, help="declared cadence (default: measured)")
     v.add_argument("--allow-short-history", action="store_true",
                    help="treat 'fewer windows than the calibration floor' as a warning")
     t = sub.add_parser("template", help="print the required-field guide and an example envelope")
     t.add_argument("--bundle")
+    t.add_argument("--bundle-sha256")
     t.add_argument("--paired-bundle")
+    t.add_argument("--paired-bundle-sha256")
     a = ap.parse_args(argv)
+    try:
+        if a.bundle:
+            a.bundle = load_pinned_bundle(a.bundle, a.bundle_sha256)
+        if a.paired_bundle:
+            a.paired_bundle = load_pinned_bundle(a.paired_bundle, a.paired_bundle_sha256)
+    except (OSError, ValueError, pickle.UnpicklingError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     if a.cmd == "template":
         spec = required_from_bundle(a.bundle, a.paired_bundle) if a.bundle else default_required()
         print(json.dumps(template(spec), indent=2))

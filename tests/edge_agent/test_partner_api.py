@@ -204,8 +204,8 @@ def test_blurredbox_edge_runs_incident_and_erase_as_the_service_user_with_agent_
     assert cli.main(["incident", "mark", "--start", "2026-11-03T14:00", "--end", "2026-11-03T15:00"]) == 0
     assert cli.main(["erase", "--yes"]) == 0
     (c1, e1), (c2, e2) = seen
-    assert c1[1:] == ["-m", "edge_agent", "incident", "mark", "--start", "2026-11-03T14:00",
+    assert c1[1:] == ["-I", "-m", "edge_agent", "incident", "mark", "--start", "2026-11-03T14:00",
                       "--end", "2026-11-03T15:00", "--config", str(cli.CONFIG)]
-    assert c2[1:] == ["-m", "edge_agent", "erase", "--yes", "--config", str(cli.CONFIG)]
+    assert c2[1:] == ["-I", "-m", "edge_agent", "erase", "--yes", "--config", str(cli.CONFIG)]
     assert e1 == e2 == {"AGD_HMAC_SECRET": "x", "BLURREDBOX_API_KEY": "y"}       # environment, not argv
     assert not any("x" == a or "y" == a for a in c1 + c2)

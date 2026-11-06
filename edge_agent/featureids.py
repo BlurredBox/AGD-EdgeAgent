@@ -16,6 +16,7 @@ import hmac
 import json
 import os
 import secrets
+import time
 from pathlib import Path
 
 
@@ -28,22 +29,51 @@ class FeatureIdMap:
         self._load()
 
     def _load(self) -> None:
-        try:
-            d = json.loads(self.path.read_text())
-            self._salt = bytes.fromhex(d["salt"])
-            self._by_id = dict(d["ids"])
-            self._by_name = {n: i for i, n in self._by_id.items()}
-        except (OSError, ValueError, KeyError):
-            self._salt = secrets.token_bytes(32)
-            self._save()
+        """Read the salt. An id is HMAC(salt, name), so the salt is what must never change: a file that
+        exists but cannot be parsed is kept aside (`.corrupt-<time>`), the backup copy (`.bak`) is tried, and only if
+        both fail is a new salt made, flagged in `salt_regenerated` so the agent can alert."""
+        self.salt_regenerated = False
+        damaged = False
+        for candidate in (self.path, self.path.with_suffix(".bak")):
+            try:
+                text = candidate.read_text()
+            except FileNotFoundError:
+                continue                       # nothing there yet
+            # Any other OSError (EACCES, EIO, ...) propagates: an unreadable disk must stop the agent, not mint
+            # a new salt, which would change every feature id.
+            try:
+                d = json.loads(text)
+                self._salt = bytes.fromhex(d["salt"])
+                ids = d.get("ids")
+                self._by_id = dict(ids) if isinstance(ids, dict) else {}
+                self._by_name = {n: i for i, n in self._by_id.items()}
+            except (ValueError, KeyError, TypeError, AttributeError):
+                damaged = True
+                continue
+            if candidate is not self.path:
+                self._save()
+            return
+        if damaged:
+            self.salt_regenerated = True
+            if self.path.exists():
+                try:
+                    os.replace(self.path, self.path.with_name(f"{self.path.stem}.corrupt-{int(time.time())}"))
+                except OSError:
+                    pass
+        self._salt = secrets.token_bytes(32)
+        self._save()
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump({"salt": self._salt.hex(), "ids": self._by_id}, fh, sort_keys=True)
-        os.replace(tmp, self.path)
+        payload = json.dumps({"salt": self._salt.hex(), "ids": self._by_id}, sort_keys=True)
+        for dest in (self.path.with_suffix(".bak"), self.path):
+            tmp = dest.with_suffix(".tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, dest)
 
     def id_for(self, name: str) -> str:
         known = self._by_name.get(name)

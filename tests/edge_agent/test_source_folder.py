@@ -242,6 +242,44 @@ def test_bad_rows_and_missing_columns_are_counted_not_raised(tmp_path):
     assert a.describe()["files_rejected"] == 1
 
 
+def _three_files(d):
+    """a.csv and c.csv clean; b.csv has one 200,000-character field (over the csv module's limit) in row 1."""
+    d.mkdir()
+    now = time.time()
+    for i, (name, p) in enumerate((("a", 0.1), ("b", 0.2), ("c", 0.3))):
+        path = d / f"{name}.csv"
+        with open(path, "w") as fh:
+            fh.write("scored_at,p,x1,note\n")
+            for j in range(5):
+                fh.write(f"{T0 + 10 * i + j},{p},{j}.5,{'z' * 200_000 if name == 'b' and j == 0 else 'ok'}\n")
+        os.utime(path, (now - 300 + 100 * i, now - 300 + 100 * i))
+    return {"type": "folder", "path": str(d), "min_age_seconds": 0, "scan_interval_seconds": 0,
+            "columns": {"ts": "scored_at", "output": "p", "features": ["x1"]},
+            "constants": {"model_id": LOCAL_MODEL, "instrument": "all"}}
+
+
+def test_an_oversized_csv_field_is_a_bad_row_and_the_scan_goes_on(tmp_path):
+    a = FolderAdapter(_three_files(tmp_path / "in"), tmp_path / "st")
+    got = a.poll()
+    assert sorted(r.output for r in got) == [0.1] * 5 + [0.2] * 4 + [0.3] * 5
+    assert a.bad_rows == 1 and a.last_error is None
+
+
+def test_a_scan_that_fails_part_way_marks_no_file_read(tmp_path, monkeypatch):
+    a = FolderAdapter(_three_files(tmp_path / "in"), tmp_path / "st")
+    real = FolderAdapter._csv_page
+
+    def fail_on_b(self, path, *rest):
+        if path.name == "b.csv":
+            raise RuntimeError("unexpected")
+        return real(self, path, *rest)
+
+    monkeypatch.setattr(FolderAdapter, "_csv_page", fail_on_b)
+    assert a.poll() == [] and a.last_error
+    monkeypatch.setattr(FolderAdapter, "_csv_page", real)
+    assert sum(r.output == 0.1 for r in a.poll()) == 5        # the failed scan did not mark a.csv read
+
+
 # -- Parquet ---------------------------------------------------------------------------------------
 def write_parquet(path, recs, row_group_size=ROWS):
     import pyarrow as pa
@@ -324,7 +362,7 @@ def test_crash_between_spool_and_checkpoint_replays_without_loss_and_at_most_one
     both = ids(sink_a) + ids(sink_b)
     assert len(set(both)) == 6                            # nothing lost
     assert len(both) - len(set(both)) <= 1                # only the last emitted window can repeat
-    assert b.replayed_windows_skipped == 4                # windows 0-3 are older than the last emitted one
+    assert b.replayed_windows_skipped == 5                # windows 0-4: up to the last emitted one (audit F5)
     # a duplicate carries the same window id, so the server (and the spool file name) dedupes it
     assert len({p.name for p in (cfg.state_dir / "spool").rglob("*.json")}) <= 6
 

@@ -9,7 +9,9 @@ import hashlib
 import json
 import os
 import queue
+import time
 from abc import ABC, abstractmethod
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Callable, Iterable
@@ -74,9 +76,11 @@ HEAD_BYTES = 256
 
 
 class JsonlTailAdapter(SourceAdapter):
-    """Tails a JSON-lines file; the byte offset is persisted so a restart neither
-    replays nor skips lines. Rotation restarts at 0 (audit F13): a new inode, a changed
-    head (copytruncate), a shrunk file, or a saved offset that is not at a line end.
+    """Tails a JSON-lines file. The byte offset is persisted only on `commit(before)`, once
+    every row before it sits in a closed window in the durable spool (or, at a stop, in the
+    kept open windows): a crash replays from the last committed offset and loses nothing.
+    Rotation restarts at 0 (audit F13): a new inode, a changed head (copytruncate), a
+    shrunk file, or a saved offset that is not at a line end.
 
     Default line shape: {"ts", "model_id", "instrument", "features": {...}, "output"}.
     `parse` can map any other shape to those five keys. Unparseable lines are
@@ -92,7 +96,10 @@ class JsonlTailAdapter(SourceAdapter):
         # "<inode>:<sha256 of the first min(offset, HEAD_BYTES) bytes>", beside the offset file (which stays a bare int)
         self._ident_file = self.offset_file.with_name(self.offset_file.name + ".id")
         self._ident: str | None = None
-        self._offset = self._load_offset()
+        self._offset = self._committed = self._load_offset()   # read position / durable position
+        self._committed_ident = self._ident
+        # per poll: (newest row ts, offset after it, identity at that offset)
+        self._staged: deque[tuple[float, int, str | None]] = deque()
 
     def _load_offset(self) -> int:
         try:
@@ -105,13 +112,19 @@ class JsonlTailAdapter(SourceAdapter):
             return 0
 
     def _save_offset(self) -> None:
-        self.offset_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.offset_file.with_suffix(".tmp")
-        tmp.write_text(str(self._offset))
-        os.replace(tmp, self.offset_file)
-        if self._ident:                    # after the offset: a crash between the two re-reads from 0, never skips
-            tmp.write_text(self._ident)
-            os.replace(tmp, self._ident_file)
+        from edge_agent.checkpoint import write_text_atomic     # checkpoint imports this module
+        write_text_atomic(self.offset_file, str(self._committed))   # temp, fsync, replace, fsync dir
+        if self._committed_ident:          # after the offset: a crash between the two re-reads from 0, never skips
+            write_text_atomic(self._ident_file, self._committed_ident)
+
+    def commit(self, before: datetime | None = None) -> None:
+        limit = None if before is None else before.timestamp()
+        moved = False
+        while self._staged and (limit is None or self._staged[0][0] < limit):
+            _, self._committed, self._committed_ident = self._staged.popleft()
+            moved = True
+        if moved:
+            self._save_offset()
 
     def _identity(self, fh, ino: int) -> str:
         fh.seek(0)
@@ -135,7 +148,10 @@ class JsonlTailAdapter(SourceAdapter):
         with fh:
             st = os.fstat(fh.fileno())     # the inode of the file actually read, not of a path renamed meanwhile
             if self._rotated(fh, st):
-                self._offset = 0
+                self._offset = self._committed = 0             # older positions name the old file
+                self._committed_ident = None
+                self._staged = deque((ts, 0, None) for ts, _, _ in self._staged)
+                self._save_offset()
                 self.rotations += 1
             fh.seek(self._offset)
             while len(out) < max_records:
@@ -156,7 +172,10 @@ class JsonlTailAdapter(SourceAdapter):
                 except Exception:          # noqa: BLE001 -- counted, never raised
                     self.bad_lines += 1
             self._ident = self._identity(fh, st.st_ino)
-        self._save_offset()
+        if self._offset != (self._staged[-1][1] if self._staged else self._committed):
+            from edge_agent.checkpoint import FUTURE_CLAMP_SECONDS
+            newest = max((r.ts.timestamp() for r in out), default=float("-inf"))
+            self._staged.append((min(newest, time.time() + FUTURE_CLAMP_SECONDS), self._offset, self._ident))
         return out
 
     def describe(self) -> dict:

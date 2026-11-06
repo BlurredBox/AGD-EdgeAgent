@@ -296,7 +296,7 @@ def main(argv: list[str] | None = None, *, post: Callable | None = None,
     a = ap.parse_args(argv)
     try:
         raw = json.loads(Path(a.config).read_text())
-        cfg = load_edge_config(raw, need_secret=a.apply)
+        cfg = load_edge_config(raw, need_secret=a.apply, path=a.config)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         ap.exit(2, f"edge_agent replay-rejected: cannot load the config: {type(exc).__name__}: {exc}\n")
     now = (clock or (lambda: datetime.now(timezone.utc)))()

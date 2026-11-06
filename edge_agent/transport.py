@@ -50,8 +50,10 @@ class DurableSpool:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
         self.rejected = self.root / "rejected"
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.rejected.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.rejected.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.root, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(self.rejected, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
         self.quarantine = self.root / QUARANTINE_DIR
 
     def put(self, body: dict[str, Any], window_end: datetime) -> Path:

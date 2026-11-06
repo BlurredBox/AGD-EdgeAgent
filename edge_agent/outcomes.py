@@ -62,20 +62,18 @@ class OutcomeJoin:
             # never emitted; only this process's in-flight ids are deduplicated.
             self._remember(key)
             return True
-        with self.db:
-            self.db.execute("INSERT INTO predictions(model,id,ts,output,label,known_at) VALUES(?,?,?,?,?,?)",
-                            (rec.model_id, rec.prediction_id, rec.ts.timestamp(), rec.output, rec.outcome,
-                             rec.outcome_observed_at.timestamp() if rec.outcome_observed_at else None))
-            removed = self.db.execute("DELETE FROM predictions WHERE ts < ?",
-                                      (now.timestamp() - self.max_age_seconds,)).rowcount
-            self._retained += 1 - removed
-            overflow = max(0, self._retained - self.max_records)
-            if overflow:
-                pruned = self.db.execute("DELETE FROM predictions WHERE rowid IN (SELECT rowid FROM "
-                                         "predictions ORDER BY ts, rowid LIMIT ?)", (overflow,)).rowcount
-                removed += pruned
-                self._retained -= pruned
-            self.counts["evicted"] += removed
+        # No commit here: the caller commits once per batch (`commit()`), not once per row (audit F15).
+        # Age-based expiry is `expire()`'s job (every tick); only the size cap is enforced per insert.
+        self.db.execute("INSERT INTO predictions(model,id,ts,output,label,known_at) VALUES(?,?,?,?,?,?)",
+                        (rec.model_id, rec.prediction_id, rec.ts.timestamp(), rec.output, rec.outcome,
+                         rec.outcome_observed_at.timestamp() if rec.outcome_observed_at else None))
+        self._retained += 1
+        overflow = max(0, self._retained - self.max_records)
+        if overflow:
+            pruned = self.db.execute("DELETE FROM predictions WHERE rowid IN (SELECT rowid FROM "
+                                     "predictions ORDER BY ts, rowid LIMIT ?)", (overflow,)).rowcount
+            self._retained -= pruned
+            self.counts["evicted"] += pruned
         self._remember(key)
         return True
 
@@ -108,9 +106,8 @@ class OutcomeJoin:
                 log.warning("outcome_label_conflict")
                 raise ValueError("conflicting outcome for prediction")
             return "duplicate"
-        with self.db:
-            self.db.execute("UPDATE predictions SET label=?,known_at=? WHERE model=? AND id=?",
-                            (outcome, observed_at.timestamp(), model_id, prediction_id))
+        self.db.execute("UPDATE predictions SET label=?,known_at=? WHERE model=? AND id=?",
+                        (outcome, observed_at.timestamp(), model_id, prediction_id))
         disposition = "late" if row[2] else "matched"
         self.counts[disposition] += 1
         if disposition == "late":
@@ -135,17 +132,20 @@ class OutcomeJoin:
 
     def mark_emitted(self, model: str, start: datetime, end: datetime) -> None:
         """Seal a durably queued interval; later labels never mutate its scoring."""
-        with self.db:
-            self.db.execute("UPDATE predictions SET emitted=1 WHERE model=? AND ts>=? AND ts<?",
-                            (model, start.timestamp(), end.timestamp()))
+        self.db.execute("UPDATE predictions SET emitted=1 WHERE model=? AND ts>=? AND ts<?",
+                        (model, start.timestamp(), end.timestamp()))
 
     def expire(self, now: datetime) -> None:
         """Remove expired metadata even while the prediction stream is idle."""
-        with self.db:
-            removed = self.db.execute("DELETE FROM predictions WHERE ts < ?",
-                                      (now.timestamp() - self.max_age_seconds,)).rowcount
+        removed = self.db.execute("DELETE FROM predictions WHERE ts < ?",
+                                  (now.timestamp() - self.max_age_seconds,)).rowcount
         self._retained -= removed
         self.counts["evicted"] += removed
+
+    def commit(self) -> None:
+        """Make everything since the last commit durable (one fsync for a whole batch of rows)."""
+        if not self._closed and self.db.in_transaction:
+            self.db.commit()
 
     def status(self) -> dict:
         """Return aggregate join health without prediction ids, outputs or labels."""
@@ -157,5 +157,6 @@ class OutcomeJoin:
     def close(self) -> None:
         """Release the local database connection."""
         if not self._closed:
+            self.commit()
             self.db.close()
             self._closed = True

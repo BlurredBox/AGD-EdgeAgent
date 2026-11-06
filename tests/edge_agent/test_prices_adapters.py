@@ -67,6 +67,7 @@ def test_jsonl_tail_resumes_from_offset_and_waits_for_partial_lines(tmp_path):
     log.write_text(line(1) + line(2) + line(3)[:20])                    # last line half-written
     t = JsonlTailAdapter(log, tmp_path / "off")
     assert [r.features["a"] for r in t.poll()] == [1, 2]
+    t.commit()                                                          # the agent: rows are durable
     with open(log, "a") as fh:
         fh.write(line(3)[20:] + "not json\n" + line(4))
     t2 = JsonlTailAdapter(log, tmp_path / "off")                        # restart
@@ -94,8 +95,10 @@ def test_jsonl_tail_restarts_after_copytruncate_across_a_restart(tmp_path):
     log = tmp_path / "m.jsonl"
     log.write_text(_rows(range(5)))
     ino = log.stat().st_ino
-    assert len(JsonlTailAdapter(log, tmp_path / "off").poll()) == 5
-    log.write_text(_rows(range(1000, 1040)))                           # truncated and rewritten in place
+    first = JsonlTailAdapter(log, tmp_path / "off")
+    assert len(first.poll()) == 5
+    first.commit()                                                      # offset and identity reach the disk
+    log.write_text(_rows(range(1000, 1040)))                         # truncated and rewritten in place
     assert log.stat().st_ino == ino
     t2 = JsonlTailAdapter(log, tmp_path / "off")                        # restart: the identity is in off.id
     assert [r.features["a"] for r in t2.poll()] == list(range(1000, 1040)) and t2.bad_lines == 0
@@ -107,6 +110,7 @@ def test_jsonl_tail_never_resumes_mid_line_from_an_old_format_offset(tmp_path):
     (tmp_path / "off").write_text("7")                                  # pre-F13 state: no off.id, not at a line end
     t = JsonlTailAdapter(log, tmp_path / "off")
     assert [r.features["a"] for r in t.poll()] == [0, 1, 2] and t.bad_lines == 0
+    t.commit()
     assert len(JsonlTailAdapter(log, tmp_path / "off").poll()) == 0     # with off.id saved it resumes at the end
 
 

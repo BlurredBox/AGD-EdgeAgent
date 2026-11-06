@@ -228,15 +228,25 @@ class FolderAdapter(CheckpointedAdapter):
                     cur["consumed"] += len(line)
                     yield line.decode(self.encoding)
 
+            def parsed():
+                reader = csv.reader(lines(), delimiter=self.delimiter)
+                while True:
+                    try:
+                        yield next(reader)
+                    except StopIteration:
+                        return
+                    except csv.Error:            # e.g. a field over csv.field_size_limit(): one bad row
+                        yield None
+
             recs, bad, rows, newest, good = [], 0, 0, None, offset
-            for row in csv.reader(lines(), delimiter=self.delimiter):
+            for row in parsed():
                 if cur["trunc"]:
                     break                        # a quoted field cut off mid-row: wait for the rest
                 good = cur["consumed"]
-                if not row:
+                if row == []:
                     continue
                 rows += 1
-                if len(row) != len(header):
+                if row is None or len(row) != len(header):
                     bad += 1
                 else:
                     cells = dict(zip(header, row))
@@ -383,7 +393,10 @@ class FolderAdapter(CheckpointedAdapter):
         self._last_scan = now
         max_records = min(max_records, self.max_uncommitted_rows - self._staged_rows)
         try:
-            for recs, bad, rows, newest, delta in self._advance(self._live, max_records):
+            live = dict(self._live)               # entries are replaced, never mutated: a shallow copy is a snapshot
+            batches = self._advance(live, max_records)
+            self._live = live                     # only a completed scan moves the cursor
+            for recs, bad, rows, newest, delta in batches:
                 self.bad_rows += bad
                 self._stage(newest, delta, rows)
                 out.extend(recs)
