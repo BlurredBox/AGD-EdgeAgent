@@ -109,7 +109,7 @@ def test_close_without_keep_open_still_flushes_for_replays(tmp_path):
 
 
 def test_jsonl_offset_and_kept_rows_together_lose_nothing_and_repeat_nothing(tmp_path):
-    """The tail adapter saves its offset as it reads; the kept file holds the rows past the last closed window."""
+    """The stop commits the tail offset once the kept file holds the rows past the last closed window."""
     cfg = _cfg(tmp_path)
     log = tmp_path / "model.jsonl"
     recs = make_stream(3, rows=10)

@@ -7,6 +7,7 @@ import math
 import os
 import signal
 import threading
+import time
 import structlog
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,7 @@ from edge_agent.adapters import SourceAdapter
 from edge_agent.checkpoint import write_json_atomic
 from edge_agent.config import EdgeConfig
 from edge_agent.featureids import FeatureIdMap
+from edge_agent.housekeeping import trim_spool
 from edge_agent.prices import FredDailyAdapter, PriceAdapter, StaticPriceAdapter
 from edge_agent.records import Record, record_from_json, record_to_json
 from edge_agent.outcomes import OutcomeJoin
@@ -96,14 +98,22 @@ class EdgeAgent:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.ops_provider = ops_provider            # optional host-ops (`ops_*`) hook
         sd = cfg.state_dir
-        sd.mkdir(parents=True, exist_ok=True)
+        sd.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(sd, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
         if prices is None:
             prices = (FredDailyAdapter(cfg.instrument_series, sd / "prices",
-                                       max_staleness_days=cfg.price_max_staleness_days)
+                                       max_staleness_days=cfg.price_max_staleness_days, background=True)
                       if cfg.instrument_series else StaticPriceAdapter({}))
         self.prices = prices
         self.alerter = LocalAlerter(sd / "alerts.jsonl", cfg.alert_cooldown_seconds)
         self.ids = FeatureIdMap(sd / "feature_ids.json")
+        if self.ids.salt_regenerated:
+            self.alerter.raise_alert(
+                REJECTED, "*", "feature_ids.json was unreadable and no backup could be read: every feature id "
+                "changed (the old file is kept as feature_ids.corrupt-<time>); server-side per-feature series restart",
+                key="feature_salt")
+        self._check_cadence_marker(sd)
+        self._housekeeping_at = float("-inf")
         self.sender = Sender(cfg, DurableSpool(sd / "spool"), self.alerter,
                              post=post, clock=self._clock)
         self.models: dict[str, _ModelRuntime] = {}
@@ -133,6 +143,7 @@ class EdgeAgent:
         self._open_file = sd / OPEN_WINDOWS_FILE
         self._restored_upto: dict[str, int] = {}
         self.open_rows_restored = self._restore_open_windows()
+        self._sources_held = False      # audit F10: after an unexpected error no source position moves again
 
     # -- alerts -------------------------------------------------------------------
     def on_alert(self, cb: Callable[[LocalAlert], None]) -> None:
@@ -226,7 +237,8 @@ class EdgeAgent:
                 except ValueError:
                     self.outcome_rows_rejected += 1
                     collection_log.warning("outcome_source_row_rejected")
-        for source in self.outcome_sources:       # a label is in the join (sqlite) once record_outcome returns
+        self.outcomes.commit()                    # one commit per poll, not per row (audit F15)
+        for source in self.outcome_sources:       # a label is in the join (sqlite) once committed
             source.commit(None)
         self._poll_proxy()
         self._poll_upstream()
@@ -258,6 +270,8 @@ class EdgeAgent:
     def _commit_prediction_sources(self, *, everything: bool = False) -> None:
         """Tell checkpointing sources what is now safe: every record whose window is closed
         (hence in the durable spool). Records still in an open window are replayed after a crash."""
+        if self._sources_held:
+            return
         before = None
         if not everything:
             starts = [s for s in (m.cutter.earliest_open_start() for m in self.models.values()) if s]
@@ -273,6 +287,12 @@ class EdgeAgent:
         """Close windows by the wall clock, check the feed, refresh prices, drain the spool."""
         now = now or self._clock()
         self.outcomes.expire(now)
+        if time.monotonic() - self._housekeeping_at > 3600:
+            self._housekeeping_at = time.monotonic()
+            try:
+                trim_spool(self.cfg.state_dir / "spool")
+            except OSError:
+                collection_log.warning("housekeeping_failed")
         if self.proxy is not None:
             self.proxy.expire(now)
             delays = {s.proxy_name: s.proxy_delay_s for s in self.proxy_sources}
@@ -294,9 +314,29 @@ class EdgeAgent:
                     f"no model records for {(now - ref).total_seconds():.0f}s "
                     f"(limit {self.cfg.feed_down_after_seconds:.0f}s)", key="down")
         self.sender.drain()
+        self.outcomes.commit()                    # before the source offsets move past rows registered here
         self._commit_prediction_sources()
         self._forget_restored_once_closed()
         self.write_status(now)
+
+    def _check_cadence_marker(self, sd) -> None:
+        """Trajectory state and reference counts are indexed by ts // cadence; a changed cadence reuses them
+        without migration, so say so (log and local alert) instead of silently mixing two bucket sizes."""
+        marker = sd / "cadence_seconds"
+        try:
+            before = int(marker.read_text().strip())
+        except (OSError, ValueError):
+            before = None
+        if before is not None and before != self.cfg.cadence_seconds:
+            collection_log.warning("cadence_changed", before=before, now=self.cfg.cadence_seconds)
+            self.alerter.raise_alert(
+                REJECTED, "*", f"cadence_seconds changed from {before} to {self.cfg.cadence_seconds}: saved "
+                "trajectory and reference state were built with the old cadence; clear the state directory "
+                "to rebuild the baseline", key="cadence")
+        try:
+            write_json_atomic(marker, self.cfg.cadence_seconds)
+        except OSError:
+            collection_log.warning("cadence_marker_write_failed")
 
     def write_status(self, now: datetime | None = None, *, force: bool = False) -> None:
         """Publish a counts-only snapshot for `python -m edge_agent --status` (atomic, 0600)."""
@@ -316,8 +356,22 @@ class EdgeAgent:
             collection_log.warning("status_snapshot_write_failed")   # never stops collection
 
     def run_once(self) -> None:
-        self.poll()
-        self.tick()
+        try:
+            self.poll()
+            self.tick()
+        except Exception as exc:
+            self._hold_sources(exc)
+            raise
+
+    def _hold_sources(self, exc: Exception) -> None:
+        """Audit F10: an error other than a rejected row (sqlite, a full disk, a bug) stopped a poll or tick
+        part way. Rows read since the last checkpoint may be neither in the spool nor in a kept window, so no
+        source position moves again in this process; the restart replays them (windows already queued are
+        skipped by the emitted watermark)."""
+        self._sources_held = True
+        collection_log.error("collection_stopped_sources_held", error_type=type(exc).__name__)
+        self.alerter.raise_alert(REJECTED, "*", f"collection stopped ({type(exc).__name__}); source positions "
+                                 "held at the last durable checkpoint, the restart replays the rows", key="held")
 
     def run_forever(self, interval_seconds: float = 1.0) -> None:       # pragma: no cover
         # SIGTERM/SIGINT only set a flag: the loop exits between iterations, so a stop never
@@ -347,7 +401,9 @@ class EdgeAgent:
         """Shut down. `keep_open` (the running service's stop): windows still open are written to the state with
         their rows and resumed by the next start, which sends each at its real end; nothing is closed early.
         Without it (end of a replay, tests): every open window is closed and queued now."""
-        if keep_open:
+        if self._sources_held:
+            self.sender.drain(force=True)       # keep and commit nothing: the restart replays from the checkpoint
+        elif keep_open:
             try:
                 self.save_open_windows()
             except (TypeError, ValueError, OSError) as exc:
@@ -359,18 +415,21 @@ class EdgeAgent:
                 # The kept rows are in open_windows.json now: commit the source offsets BEFORE the drain. The drain
                 # can run past TimeoutStopSec / stop_grace_period; a SIGKILL during it must not leave the rows both
                 # in the kept file and uncommitted in the source, or the restart counts them twice (pre-tag review).
+                self.outcomes.commit()          # the join rows before the offsets that make them unrecoverable
                 self._commit_prediction_sources(everything=True)
                 self.sender.drain(force=True)
         else:
             self.flush()
             self._open_file.unlink(missing_ok=True)
+        self.outcomes.commit()
         self._commit_prediction_sources(everything=True)  # open rows are in the state file or closed (no-op if done)
-        for source in self.outcome_sources:
+        for source in [] if self._sources_held else self.outcome_sources:
             source.commit(None)
         if self.outbox is not None:
             self.outbox.drain(force=True)
         self.write_status(force=True)
         self.sender.close()
+        self.outcomes.commit()
         self.outcomes.close()
         if self.proxy is not None:
             self.proxy.close()
@@ -447,10 +506,11 @@ class EdgeAgent:
     # -- one closed window ----------------------------------------------------------
     def _window(self, m: _ModelRuntime, win: ClosedWindow) -> None:
         done = self._emitted_end.get(m.model_id)
-        if done is not None and win.end.isoformat() < done:
+        if done is not None and win.end.isoformat() <= done:
             # Source replay after a crash re-reads rows of windows that were already queued
             # (the checkpoint trails the spool). Re-computing them would count them twice in the
-            # baseline; the window of the same end is still re-sent below so the spool stays whole.
+            # baseline. The watermark moves only after the spool write and the state save, so the
+            # window of the same end is already durable; a replay may hold only part of its rows.
             self.replayed_windows_skipped += 1
             collection_log.info("replayed_window_skipped")
             return
@@ -532,6 +592,7 @@ class EdgeAgent:
             collection_log.error("collection_checkpoint_failed_payload_queued")
             raise
         self.outcomes.mark_emitted(m.model_id, win.start, win.end)
+        self.outcomes.commit()                    # sealed on disk before the window can be sent (a crash after a send re-closes it otherwise)
         if self.proxy is not None:
             self.proxy.add_window(m.model_id, win.start, win.end)
         m.collection["disposition"] = "durably_queued"

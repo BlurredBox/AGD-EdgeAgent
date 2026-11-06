@@ -39,7 +39,7 @@ def child_env(base: dict[str, str] | None = None, env_file: Path | None = None) 
 
 def run_agent_forever(stop_requested) -> None:
     py = APP / "venv" / "Scripts" / "python.exe"
-    cmd = [str(py), "-m", "edge_agent", "--config", str(CONF / "config.json")]
+    cmd = [str(py), "-I", "-m", "edge_agent", "--config", str(CONF / "config.json")]   # -I: never import from DATA
     while not stop_requested():
         env = child_env()
         child = subprocess.Popen(cmd, env=env, cwd=str(DATA), creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)

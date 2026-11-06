@@ -2,11 +2,21 @@
 edge_agent -- the partner-side producer of `z_t` (gap G1).
 
 Runs on the PARTNER's infrastructure. It observes the monitored model's
-inputs and outputs locally, pulls PUBLIC market prices itself, computes the
-signal vector by importing `corpus/`, and POSTs only the closed-schema `z_t`
-scalars to `/v1/ingest/signal`. Raw feature values, predictions, prices, logs
-and feature names never leave: see `wire.py` for the single place a payload is
-assembled and audited.
+inputs and outputs locally, computes the signal vector by importing `corpus/`,
+and POSTs only the closed-schema `z_t` scalars to `/api/v1/ingest/signal`.
+What leaves is per-window summary statistics: score quantiles (p1..p99 of the
+model's outputs) and per-feature drift statistics under hashed feature ids.
+Individual records, raw feature values, feature names, logs and prices are not
+sent: see `wire.py` for the single place a payload is assembled and audited.
+
+The only other outbound call is optional and off by default: with
+`instrument_series` configured, the agent fetches public daily closes from
+fred.stlouisfed.org (one request per series, which tells that third party which
+series you follow; size, time and redirect limits apply, see `prices.py`).
+
+Platform: Linux is the supported platform (systemd service or container). The
+Windows service wrapper in `packaging/edge_agent/installer/windows/` is untested
+and not offered; on Windows the 0600 state-file modes are not enforced.
 
 Data flow
 ---------

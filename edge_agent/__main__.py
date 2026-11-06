@@ -132,16 +132,23 @@ def _unreadable(where: str, exc: OSError) -> dict:
                                              if where == "outcome_source" else ".")}
 
 
-def load_edge_config(raw: dict, *, need_secret: bool) -> EdgeConfig:
+def load_edge_config(raw: dict, *, need_secret: bool, path: str | None = None) -> EdgeConfig:
     """EdgeConfig from agent.json fields (the source blocks already taken out, or ignored here).
-    `secret_env` names the variable holding the HMAC secret; without `need_secret` it is not read."""
+    `secret_env` names the variable holding the HMAC secret; without `need_secret` it is not read.
+    `path` is the config file: an inline `secret` in a group- or world-readable file is refused (F11)."""
     raw = {k: v for k, v in raw.items()
            if k not in ("source", "outcome_source", "proxy_source", "upstream_source")}
     if "secret_env" in raw:
         name = raw.pop("secret_env")
+        if need_secret and name not in os.environ:
+            raise ValueError(f"secret_env names the environment variable {name!r}, which is not set")
         raw["secret"] = os.environ[name] if need_secret else ""
+    elif need_secret and path and raw.get("secret") and os.stat(path).st_mode & 0o077:
+        raise ValueError(f"{path} holds the signing secret and is readable by other users; run: chmod 600 {path}")
     elif not need_secret:
         raw.setdefault("secret", "")
+    if need_secret and not raw.get("secret"):
+        raise ValueError("secret is empty: set secret_env to a variable holding the HMAC secret")
     for k in ("feature_bounds",):
         if k in raw:
             raw[k] = {a: tuple(b) for a, b in raw[k].items()}
@@ -185,7 +192,21 @@ def main() -> None:
         live = _trusted_bundle(args.bundle, args.bundle_sha256)
         paired = _trusted_bundle(args.paired_bundle, args.paired_bundle_sha256) if args.paired_bundle else None
         required = required_from_bundle(live, paired)
-    cfg = load_edge_config(raw, need_secret=not args.check)
+    try:
+        cfg = load_edge_config(raw, need_secret=not args.check, path=args.config)
+    except KeyError as exc:
+        ap.error(f"environment variable {exc.args[0]} named by secret_env is not set")
+    except (ValueError, TypeError) as exc:
+        ap.error(f"invalid config: {exc}")
+    if sys.platform == "win32" and not args.check:
+        sys.stderr.write("warning: Windows is not a supported platform for the edge agent; state-file permissions "
+                         "are not restricted and a service stop may not flush the open window\n")
+    if not args.check:
+        from edge_agent.statelock import StateLockError, acquire
+        try:
+            _state_lock = acquire(cfg.state_dir)          # held until the process exits
+        except StateLockError as exc:
+            ap.error(str(exc))
     try:
         taken: set[str] = set()
         adapters = build_sources(src, cfg.state_dir, "prediction", taken=taken)
@@ -201,7 +222,7 @@ def main() -> None:
             ap.error(str(exc))
         sys.stdout.write(json.dumps({"verdict": "NOT_READY", "config_error": str(exc),
                                      "scoring_verified": False}, sort_keys=True) + "\n")
-        raise SystemExit(2)
+        raise SystemExit(2) from None
     if args.check:
         sys.stdout.write(json.dumps(report, sort_keys=True) + "\n")
         if report["verdict"] not in PASSING_VERDICTS:

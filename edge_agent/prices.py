@@ -9,6 +9,8 @@ import bisect
 import csv
 import io
 import os
+import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -36,7 +38,7 @@ class PriceAdapter(ABC):
         None, never a carried-forward or fabricated number.
         """
 
-    def refresh(self, instruments: list[str]) -> None:
+    def refresh(self, instruments: list[str]) -> None:  # noqa: B027 -- optional hook, default no-op
         """Best-effort fetch of new public data; never raises."""
 
 
@@ -64,11 +66,26 @@ class StaticPriceAdapter(PriceAdapter):
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
 
 
-def _http_get_text(url: str, timeout: float = 15.0) -> str:
+MAX_RESPONSE_BYTES = 1_000_000      # a FRED daily series is well under this
+FETCH_DEADLINE_SECONDS = 20.0       # total wall time for one fetch, not per read
+_SERIES_ID = re.compile(r"[A-Za-z0-9_]{1,40}")
+
+
+def _http_get_text(url: str, timeout: float = 10.0) -> str:
+    """GET with a size cap, a total deadline and no redirects (a redirect could leave the public host)."""
     import httpx
-    r = httpx.get(url, timeout=timeout, follow_redirects=True)
-    r.raise_for_status()
-    return r.text
+    deadline = time.monotonic() + FETCH_DEADLINE_SECONDS
+    chunks, size = [], 0
+    with httpx.stream("GET", url, timeout=timeout, follow_redirects=False) as r:
+        r.raise_for_status()
+        for chunk in r.iter_bytes():
+            size += len(chunk)
+            if size > MAX_RESPONSE_BYTES:
+                raise ValueError("response larger than the size limit")
+            if time.monotonic() > deadline:
+                raise TimeoutError("fetch deadline exceeded")
+            chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 class FredDailyAdapter(PriceAdapter):
@@ -88,8 +105,14 @@ class FredDailyAdapter(PriceAdapter):
 
     def __init__(self, instrument_series: dict[str, str], cache_dir: str | Path, *,
                  max_staleness_days: int = 5, refresh_every_seconds: float = 6 * 3600,
-                 fetch: Callable[[str], str] | None = None) -> None:
+                 fetch: Callable[[str], str] | None = None, background: bool = False) -> None:
+        for sid in instrument_series.values():
+            if not isinstance(sid, str) or not _SERIES_ID.fullmatch(sid):
+                raise ValueError("FRED series ids must be 1-40 letters, digits or underscores")
         self.series = dict(instrument_series)
+        self.background = background        # fetch on a worker thread so `tick` never waits on the network
+        self._lock = threading.Lock()
+        self._worker: threading.Thread | None = None
         self.cache_dir = Path(cache_dir)
         self.max_staleness_days = max_staleness_days
         self.refresh_every = refresh_every_seconds
@@ -129,6 +152,21 @@ class FredDailyAdapter(PriceAdapter):
         self._data[inst] = self._parse(text)
 
     def refresh(self, instruments: list[str]) -> None:
+        if not self.background:
+            self._refresh(instruments)
+            return
+        if self._worker is not None and self._worker.is_alive():
+            return                               # one fetch round at a time
+        self._worker = threading.Thread(target=self._refresh, args=(list(instruments),),
+                                        name="edge-price-refresh", daemon=True)
+        self._worker.start()
+
+    def join(self, timeout: float | None = None) -> None:
+        """Wait for a background fetch round (tests, shutdown)."""
+        if self._worker is not None:
+            self._worker.join(timeout)
+
+    def _refresh(self, instruments: list[str]) -> None:
         now = time.time()
         for inst in instruments:
             sid = self.series.get(inst)
@@ -143,14 +181,19 @@ class FredDailyAdapter(PriceAdapter):
             except Exception as exc:           # noqa: BLE001 -- offline is a normal state
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 continue
-            self._data[inst] = parsed
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp = self._cache_path(inst).with_suffix(".tmp")
-            tmp.write_text(text)
-            os.replace(tmp, self._cache_path(inst))
+            with self._lock:
+                self._data[inst] = parsed
+            try:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                tmp = self._cache_path(inst).with_suffix(".tmp")
+                tmp.write_text(text)
+                os.replace(tmp, self._cache_path(inst))
+            except OSError as exc:             # the data is in memory; a full or read-only disk must not kill the worker
+                self.last_error = f"{type(exc).__name__}: {exc}"
 
     def price_at(self, instrument: str, ts: datetime) -> PriceBar | None:
-        data = self._data.get(instrument)
+        with self._lock:
+            data = self._data.get(instrument)
         if not data or not data[0]:
             return None
         days, vals = data

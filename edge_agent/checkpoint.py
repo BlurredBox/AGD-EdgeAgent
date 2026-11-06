@@ -34,14 +34,31 @@ def state_path(state_dir: Path, name: str) -> Path:
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:
+    write_text_atomic(path, json.dumps(payload, sort_keys=True))
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Temp file, fsync, replace, fsync the directory: after a crash the file is the old or the new text."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
-        json.dump(payload, fh, sort_keys=True)
+        fh.write(text)
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+    fsync_dir(path.parent)
+
+
+def fsync_dir(directory: Path) -> None:
+    """Make a rename durable over a power loss (POSIX). Windows cannot open a directory; NTFS needs nothing here."""
+    if os.name == "nt":
+        return
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def read_json(path: Path) -> Any:

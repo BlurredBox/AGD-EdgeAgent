@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 def require_https_or_loopback(url: str) -> None:
     """The API key, signature and pairing code must not travel in clear: https, or plain http to a literal loopback
-    host (local dev / test consoles)."""
+    host (local dev / test consoles). scripts/partner_pair.py ships standalone in the kit and carries its own copy."""
     u = urlsplit(str(url))
     if u.scheme.lower() == "https" or (u.scheme.lower() == "http" and u.hostname in ("127.0.0.1", "::1", "localhost")):
         return
@@ -25,7 +25,7 @@ class EdgeConfig:
     # partner's LOCAL model id -> BlurredBox `monitored_model_id`. The local id
     # never leaves; only the generated one does.
     models: dict[str, str]
-    secret: str | bytes
+    secret: str | bytes = field(repr=False)     # never in repr/str/tracebacks
     endpoints: list[str]
     state_dir: Path
 
@@ -126,7 +126,28 @@ class EdgeConfig:
             raise ValueError("slice_feature must be a nonempty feature name")
         if type(self.labels_missing_after_windows) is not int or self.labels_missing_after_windows < 0:
             raise ValueError("labels_missing_after_windows must be an integer >= 0 (0 turns it off)")
+        self._check_bounds()
         if self.feed_down_after_seconds is None:
             self.feed_down_after_seconds = 3.0 * self.cadence_seconds
         if self.backlog_after_seconds is None:
             self.backlog_after_seconds = 2.0 * self.cadence_seconds
+
+    def _check_bounds(self) -> None:
+        """Reject values that would make every window fail or expire, at start rather than at the first window."""
+        for name in ("min_rows_per_window", "reference_max_rows", "max_rows_per_window"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"{name} must be an integer >= 1")
+        if not isinstance(self.secret, (str, bytes)):
+            raise ValueError("secret must be a string")
+        if (not isinstance(self.models, dict)
+                or not all(isinstance(k, str) and k and isinstance(v, str) and v.strip()
+                           for k, v in self.models.items())):
+            raise ValueError("models must map nonempty local model ids to nonempty BlurredBox model ids")
+        for name in ("timeout_seconds", "spool_max_age_seconds"):
+            v = getattr(self, name)
+            if not (isinstance(v, (int, float)) and math.isfinite(v) and v > 0):
+                raise ValueError(f"{name} must be a positive number")
+        for name in ("lateness_seconds", "alert_cooldown_seconds"):
+            v = getattr(self, name)
+            if not (isinstance(v, (int, float)) and math.isfinite(v) and v >= 0):
+                raise ValueError(f"{name} must be a number >= 0")

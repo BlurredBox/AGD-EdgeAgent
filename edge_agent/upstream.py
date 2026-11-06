@@ -96,6 +96,12 @@ def _env_name(spec: Mapping[str, Any], key: str, where: str) -> str:
     return v
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is an error: never replay Authorization to another host."""
+    def redirect_request(self, *a, **k):
+        return None
+
+
 class _Base:
     kind = "upstream"
 
@@ -234,7 +240,8 @@ class AirflowSource(_Base):
     def _http_get(self, url: str, headers: dict[str, str]) -> Any:
         ctx = ssl.create_default_context(cafile=self._ca) if url.startswith("https") else None
         req = urllib.request.Request(url, headers={**headers, "Accept": "application/json"}, method="GET")
-        with urllib.request.urlopen(req, timeout=self.timeout, context=ctx) as resp:
+        opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=ctx))
+        with opener.open(req, timeout=self.timeout) as resp:
             return json.loads(resp.read(2_000_000))
 
     @staticmethod

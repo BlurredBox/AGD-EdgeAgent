@@ -222,7 +222,7 @@ def main(argv: list[str] | None = None, *, request: Request | None = None,
     ap = build_parser()
     a = ap.parse_args(argv)
     try:
-        cfg = load_edge_config(json.loads(Path(a.config).read_text()), need_secret=True)
+        cfg = load_edge_config(json.loads(Path(a.config).read_text()), need_secret=True, path=a.config)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         # KeyError: the variable `secret_env` names is not set; its NAME is shown, never a value.
         ap.exit(2, f"edge_agent {a.cmd}: cannot load the config: {type(exc).__name__}: {exc}\n")

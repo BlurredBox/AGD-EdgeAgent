@@ -18,7 +18,7 @@ Group=blurredbox-edge
 Environment=OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2
 EnvironmentFile=/etc/blurredbox-edge/agent.env
 WorkingDirectory=/var/lib/blurredbox-edge
-ExecStart=/opt/blurredbox-edge/venv/bin/python -m edge_agent --config /etc/blurredbox-edge/config.json
+ExecStart=/opt/blurredbox-edge/venv/bin/python -I -m edge_agent --config /etc/blurredbox-edge/config.json
 # SIGTERM: the agent sends what is queued and keeps the window still open (with its rows) in the state; the next
 # start sends it once, at its real end (a window closed early is refused by the server).
 KillSignal=SIGTERM

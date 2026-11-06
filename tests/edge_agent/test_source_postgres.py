@@ -323,7 +323,7 @@ def test_crash_before_the_checkpoint_replays_with_at_most_one_duplicate(db, tabl
     b.close()
     both = ids(sink_a) + ids(sink_b)
     assert len(set(both)) == 6 and len(both) - len(set(both)) <= 1
-    assert b.replayed_windows_skipped == 4
+    assert b.replayed_windows_skipped == 5             # up to and including the last emitted window (audit F5)
 
 
 # -- --check / --status ----------------------------------------------------------------------------

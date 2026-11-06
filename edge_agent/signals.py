@@ -25,6 +25,7 @@ import math
 import os
 import pickle
 import random
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,7 @@ from corpus.adapters import Row
 from corpus.harness import ReferenceWindow, ReplayHarness
 from corpus.quality import check_window
 
+from edge_agent.checkpoint import fsync_dir
 from edge_agent.config import EdgeConfig
 from edge_agent.prices import PriceAdapter
 from edge_agent.reference import (ReferenceStats, build_reference, is_missing,
@@ -53,6 +55,9 @@ log = logging.getLogger("edge_agent.signals")
 _LABELLED = ("ece", "mce", "brier", "nll")
 # Meaningful only when the model output is a probability.
 _PROBABILITY_ONLY = ("positive_decision_rate", "predictive_entropy")
+# Per-model state file layout (audit F7). Files written before the version key are version 1.
+_STATE_VERSION = 1
+_STATE_NULLABLE = {"reference": ReferenceWindow, "stats": ReferenceStats, "ref_output_sd": float}
 
 
 @dataclass
@@ -98,19 +103,50 @@ class ModelSignals:
         try:
             with open(self.state_path, "rb") as fh:
                 saved = pickle.load(fh)           # our own 0600 file on the partner's disk
-        except (OSError, pickle.UnpicklingError, EOFError):
+        except FileNotFoundError:
+            return                                # first start
+        except Exception as exc:                  # noqa: BLE001 -- truncated, corrupt, or an incompatible class
+            self._cold_start(type(exc).__name__)
+            return
+        if not self._valid(saved):
+            self._cold_start("incompatible_state")
             return
         for k in self._PERSIST:
             if k in saved:
                 setattr(self, k, saved[k])
+
+    def _valid(self, saved: Any) -> bool:
+        if not isinstance(saved, dict) or saved.get("version", _STATE_VERSION) != _STATE_VERSION:
+            return False
+        for k in self._PERSIST:
+            if k in saved and not (k in _STATE_NULLABLE and saved[k] is None) and not isinstance(
+                    saved[k], _STATE_NULLABLE.get(k) or type(getattr(self, k))):
+                return False
+        return True
+
+    def _cold_start(self, why: str) -> None:
+        """Keep the unreadable file aside (never delete it) and say so: the reference rebuilds from scratch."""
+        aside: Path | None = self.state_path.with_name(f"{self.state_path.name}.corrupt-{int(time.time())}")
+        try:
+            os.replace(self.state_path, aside)
+        except OSError:
+            aside = None
+        kept = aside.name if aside else "nothing (it could not be moved)"
+        log.error("model state unreadable (%s), kept as %s: cold start", why, kept)
+        self.alerter.raise_alert(
+            REJECTED, self.model_id, f"model state unreadable ({why}); kept as {kept}; cold start: the "
+            f"reference rebuilds over {self.cfg.reference_windows} windows", key="state")
 
     def save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as fh:
-            pickle.dump({k: getattr(self, k) for k in self._PERSIST}, fh)
+            pickle.dump({"version": _STATE_VERSION, **{k: getattr(self, k) for k in self._PERSIST}}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, self.state_path)
+        fsync_dir(self.state_path.parent)
 
     @property
     def live(self) -> bool:

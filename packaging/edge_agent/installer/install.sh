@@ -26,7 +26,7 @@
 #   --wheel F  --requirements F  --wheelhouse DIR  --partner-pair F  --config-template F   override the kit paths
 #   --python PATH      Python 3.12 interpreter (default: python3.12, then python3)
 #   --with-postgres / --with-parquet / --with-kafka   also install the optional input libraries (from the wheelhouse)
-#   --online           let pip use the package index instead of only the wheelhouse
+#   --online           let pip take the third-party pins from the package index (the SDK still comes from the wheelhouse)
 #   --no-rows-wait N   on an upgrade, seconds to wait for a first row before rolling back on NO_ROWS_YET (default 300)
 #   --no-rollback-on-no-rows   on an upgrade, keep the new version when the source has no rows yet
 #   --no-setup  --uninstall  -h
@@ -103,9 +103,9 @@ if [ -z "$PY" ]; then
   for c in python3.12 python3; do command -v "$c" >/dev/null && { PY="$(command -v "$c")"; break; }; done
 fi
 [ -n "$PY" ] || die "Python 3.12 not found (install your distribution's python3.12 package, or pass --python)" 2
-"$PY" -c 'import sys; sys.exit(0 if sys.version_info[:2]==(3,12) else 1)' \
-  || die "$PY is Python $("$PY" -c 'import sys;print("%d.%d"%sys.version_info[:2])'); the agent is pinned to 3.12 (install python3.12 and pass --python)" 2
-"$PY" -c 'import venv, ensurepip' 2>/dev/null || die "$PY lacks venv/ensurepip (install python3.12-venv / python3.12-pip)" 2
+"$PY" -I -c 'import sys; sys.exit(0 if sys.version_info[:2]==(3,12) else 1)' \
+  || die "$PY is Python $("$PY" -I -c 'import sys;print("%d.%d"%sys.version_info[:2])'); the agent is pinned to 3.12 (install python3.12 and pass --python)" 2
+"$PY" -I -c 'import venv, ensurepip' 2>/dev/null || die "$PY lacks venv/ensurepip (install python3.12-venv / python3.12-pip)" 2
 
 if [ -f "$WHEELHOUSE/SHA256SUMS" ]; then
   (cd "$WHEELHOUSE" && sha256sum --quiet -c SHA256SUMS) || die "wheelhouse checksum mismatch; the kit is damaged" 2
@@ -121,16 +121,25 @@ id "$USER_" >/dev/null 2>&1 || useradd --system --gid "$USER_" --no-create-home 
 install -d -m 0755 -o root -g root "$APP" "$APP/lib"
 install -d -m 0750 -o root -g "$USER_" "$CONF"
 install -d -m 0750 -o "$USER_" -g "$USER_" "$DATA"
-install -d -m 0700 -o "$USER_" -g "$USER_" "$DATA/state"
+# hunt H1: $DATA is the service user's, so root never follows a link in it; the service user makes its own state dir.
+[ -L "$DATA/state" ] && die "$DATA/state is a symbolic link; refusing to follow it as root (remove it and re-run)" 2
+runuser -u "$USER_" -- install -d -m 0700 "$DATA/state"
 
 # ---------------------------------------------------------------- venv: build beside the old one, swap on success
 WAS_ACTIVE=0; systemctl is-active --quiet "$SVC" 2>/dev/null && WAS_ACTIVE=1
 OLD_VERSION="$(cat "$APP/VERSION" 2>/dev/null || true)"
 NEW_VERSION="$(basename "$WHEEL" | sed -E 's/^blurredbox_edge_agent-([^-]+)-.*/\1/')"
 rm -rf "$APP/venv.new" "$APP/venv.prev"
-"$PY" -m venv "$APP/venv.new"
-PIP=("$APP/venv.new/bin/python" -m pip install --disable-pip-version-check --no-input --quiet)
-if [ "$ONLINE" = 0 ]; then PIP+=(--no-index --find-links "$WHEELHOUSE"); fi
+"$PY" -I -m venv "$APP/venv.new"
+PIP=("$APP/venv.new/bin/python" -I -m pip install --disable-pip-version-check --no-input --quiet)
+KIT_ONLY=(--no-index --find-links "$WHEELHOUSE")
+if [ "$ONLINE" = 0 ]; then PIP+=("${KIT_ONLY[@]}")
+else
+  # hunt H4: the private SDK only ever from this kit, never from an index (its name is not ours on PyPI). pip then
+  # keeps the installed SDK for the edge wheel's requirement and takes only the third-party pins from the index.
+  "${PIP[@]}" "${KIT_ONLY[@]}" --no-deps blurredbox-agd \
+    || { rm -rf "$APP/venv.new"; die "no blurredbox_agd wheel for this Python in $WHEELHOUSE; --online still installs the SDK from the kit (pass --wheelhouse DIR)" 2; }
+fi
 REQS=(-r "$REQ")
 for x in $EXTRAS; do
   f="$(dirname "$REQ")/requirements-edge-$x.txt"; [ -f "$f" ] || f="$WHEELHOUSE/requirements-edge-$x.txt"
@@ -141,7 +150,7 @@ for x in $EXTRAS; do
   REQS+=(-r "$f")
 done
 "${PIP[@]}" "${REQS[@]}" blurredbox-agd "$WHEEL" || { rm -rf "$APP/venv.new"; die "pip install failed (offline wheelhouse incomplete for this Python/platform?); the existing install, if any, is unchanged"; }
-"$APP/venv.new/bin/python" -m edge_agent --help >/dev/null || { rm -rf "$APP/venv.new"; die "installed agent does not start; existing install unchanged"; }
+"$APP/venv.new/bin/python" -I -m edge_agent --help >/dev/null || { rm -rf "$APP/venv.new"; die "installed agent does not start; existing install unchanged"; }
 
 if [ -d "$APP/venv" ] && [ "$WAS_ACTIVE" = 1 ]; then systemctl stop "$SVC"; fi   # keeps the open window in the state
 [ -d "$APP/venv" ] && mv "$APP/venv" "$APP/venv.prev"
@@ -159,8 +168,8 @@ systemctl daemon-reload
 
 # ---------------------------------------------------------------- config template (only when there is no config)
 if [ ! -e "$CONF/config.json" ]; then
-  if [ -f "$TEMPLATE" ] && "$PY" -c 'import json,sys; json.load(open(sys.argv[1]))' "$TEMPLATE" 2>/dev/null; then
-    "$PY" - "$TEMPLATE" "$CONF/config.json" <<'PYEOF'
+  if [ -f "$TEMPLATE" ] && "$PY" -I -c 'import json,sys; json.load(open(sys.argv[1]))' "$TEMPLATE" 2>/dev/null; then
+    "$PY" -I - "$TEMPLATE" "$CONF/config.json" <<'PYEOF'
 import json, sys
 c = json.load(open(sys.argv[1]))
 # the kit template names the old layout; this installer owns these
@@ -183,7 +192,7 @@ PYEOF
 }
 JEOF
   fi
-  chown "$USER_:$USER_" "$CONF/config.json"; chmod 0640 "$CONF/config.json"
+  chown "root:$USER_" "$CONF/config.json"; chmod 0640 "$CONF/config.json"     # the agent only reads it
   echo "Wrote $CONF/config.json from the template."
 fi
 

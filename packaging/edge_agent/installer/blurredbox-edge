@@ -34,13 +34,16 @@ under %ProgramData%) is NOT tested on real Windows.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -89,26 +92,57 @@ def has_placeholder(v) -> bool:
     return bool(PLACEHOLDER.search(json.dumps(v)))
 
 
-def chown_service(path: Path, mode: int) -> None:
-    os.chmod(path, mode)
-    if not IS_WIN and os.geteuid() == 0:
+def set_owner(fd: int, mode: int, *, service_owns: bool = False) -> None:
+    """Mode and owner through the open fd, never through a path (hunt H1). What root writes is owned by root with
+    the service's group, so the service reads it but cannot change it; only the state directory is the service's."""
+    if IS_WIN:
+        return          # chmod on Windows only toggles the read-only flag; the ACLs come from install.ps1
+    os.fchmod(fd, mode)
+    if os.geteuid() == 0:
+        import pwd
         try:
-            import grp
-            import pwd
-            shutil.chown(path, user=SERVICE_USER, group=grp.getgrgid(pwd.getpwnam(SERVICE_USER).pw_gid).gr_name)
+            pw = pwd.getpwnam(SERVICE_USER)
         except KeyError:
             raise Fail(f"service user {SERVICE_USER!r} does not exist; run install.sh first")
+        os.fchown(fd, pw.pw_uid if service_owns else 0, pw.pw_gid)
+
+
+def own_dir(path: Path, mode: int, *, service_owns: bool = False) -> None:
+    """chmod/chown a directory without following a symlink at path: the service user owns the data directory and
+    can plant one there (hunt H1)."""
+    if IS_WIN:
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:              # ELOOP: a symlink; ENOTDIR: not a directory
+        raise Fail(f"refusing to use {path}: not a plain directory ({exc.strerror}); remove it and re-run")
+    try:
+        set_owner(fd, mode, service_owns=service_owns)
+    finally:
+        os.close(fd)
 
 
 def write_atomic(path: Path, data: str, mode: int) -> bool:
-    """Write data to path with the given mode and the service user as owner; returns True if content changed."""
-    old = path.read_text() if path.exists() else None
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    with os.fdopen(fd, "w") as f:
-        f.write(data)
-    chown_service(tmp, mode)
-    os.replace(tmp, path)
+    """Write data to path (owner root, the service's group), never through a symlink; True if the content changed.
+    Hunt H1: a fixed `<path>.tmp` opened with O_TRUNC let the service user aim root's write at any file."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        old = None
+    else:
+        if not stat.S_ISREG(st.st_mode):
+            raise Fail(f"refusing to write {path}: not a regular file (a symlink?); remove it and re-run")
+        old = path.read_text()
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")    # O_CREAT|O_EXCL|O_NOFOLLOW, random name
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+            set_owner(f.fileno(), mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
     return old != data
 
 
@@ -129,7 +163,8 @@ def as_service(cmd: list[str], env: dict[str, str], **kw) -> subprocess.Complete
     if not IS_WIN and os.geteuid() == 0:
         cmd = ["runuser", "-u", SERVICE_USER, "-m", "--", *cmd]
         full_env.update(HOME=str(DATA_DIR))
-    return subprocess.run(cmd, env=full_env, cwd=str(DATA_DIR) if DATA_DIR.is_dir() else None, **kw)
+    # hunt H5: cwd "/" and every interpreter with -I, so nothing is imported from a directory the service can write
+    return subprocess.run(cmd, env=full_env, cwd="/", **kw)
 
 
 def ask(prompt: str, *, secret: bool = False, default: str | None = None, interactive: bool) -> str | None:
@@ -267,7 +302,7 @@ def stage_certs(a: argparse.Namespace, cfg: dict) -> None:
     if not any(given):
         return
     CERTS.mkdir(parents=True, exist_ok=True)
-    chown_service(CERTS, 0o750)
+    own_dir(CERTS, 0o750)                 # root's; the service reads through the group (hunt H1)
     if a.p12:
         if not shutil.which("openssl"):
             raise Fail("--p12 needs the openssl command; extract client.pem/client.key yourself and use --client-cert/--client-key")
@@ -275,7 +310,7 @@ def stage_certs(a: argparse.Namespace, cfg: dict) -> None:
         if not pass_file:
             raise Fail("--p12 needs --p12-pass-file (the passphrase is never taken on the command line)")
         for args, dest, mode in ((["-clcerts", "-nokeys"], "client.pem", 0o644),
-                                 (["-nocerts", "-nodes"], "client.key", 0o600),
+                                 (["-nocerts", "-nodes"], "client.key", 0o640),
                                  (["-cacerts", "-nokeys"], "server-ca.pem", 0o644)):
             r = subprocess.run(["openssl", "pkcs12", "-in", a.p12, "-passin", f"file:{pass_file}", *args],
                                capture_output=True, text=True)
@@ -289,7 +324,7 @@ def stage_certs(a: argparse.Namespace, cfg: dict) -> None:
     else:
         if not (a.client_cert and a.client_key):
             raise Fail("--client-cert and --client-key go together")
-        for src, dest, mode in ((a.client_cert, "client.pem", 0o644), (a.client_key, "client.key", 0o600)):
+        for src, dest, mode in ((a.client_cert, "client.pem", 0o644), (a.client_key, "client.key", 0o640)):
             try:
                 write_atomic(CERTS / dest, Path(src).read_text(), mode)
             except OSError as exc:
@@ -340,7 +375,7 @@ def missing_values(cfg: dict, need_cert: bool) -> list[str]:
 def run_check(env: dict[str, str], full: bool = False) -> tuple[bool, str]:
     """(passed, verdict). The verdict is SOURCE_COMPATIBLE, CAUGHT_UP (passes: no new row now, but this install has
     built windows from the source before), NOT_READY or NO_ROWS_YET (empty source on a fresh install, D-10)."""
-    r = as_service([str(PY), "-m", "edge_agent", "--config", str(CONFIG), "--check"], env,
+    r = as_service([str(PY), "-I", "-m", "edge_agent", "--config", str(CONFIG), "--check"], env,
                    capture_output=True, text=True)
     out = (r.stdout or "").strip()
     try:
@@ -380,7 +415,7 @@ def pair(cfg: dict, codes: dict[str, str], env: dict[str, str], ca_for_pairing: 
         raise Fail("no pairing code for model(s) " + ", ".join(todo) +
                    ": pass --pairing-code=CODE (one model) or --pair MODEL_ID:CODE; "
                    "BlurredBox mints a code in the console and it lasts 10 minutes", 2)
-    cmd = [str(PY), str(PAIR_TOOL), "--base-url", cfg["endpoints"][0], "--install-id", cfg["install_id"]]
+    cmd = [str(PY), "-I", str(PAIR_TOOL), "--base-url", cfg["endpoints"][0], "--install-id", cfg["install_id"]]
     for s in specs:
         cmd += ["--model", s]
     if ca_for_pairing:
@@ -528,10 +563,10 @@ def cmd_setup(a: argparse.Namespace) -> int:
     CONF_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "state").mkdir(exist_ok=True)
-    chown_service(DATA_DIR / "state", 0o700)
+    own_dir(DATA_DIR / "state", 0o700, service_owns=True)
     env_changed = write_atomic(ENVFILE, "".join(f"{k}={v}\n" for k, v in sorted(env_data.items())), 0o600)
     cfg_changed = write_atomic(CONFIG, json.dumps(cfg, indent=2) + "\n", 0o640) or json.dumps(cfg, sort_keys=True) != before
-    say(f"config: {CONFIG} (0640, {SERVICE_USER})")
+    say(f"config: {CONFIG} (0640, root:{SERVICE_USER})")
 
     run_env = dict(env_data)
     say("== step 1/3: --check (reads a sample of the source; sends nothing)")
@@ -568,7 +603,7 @@ def cmd_setup(a: argparse.Namespace) -> int:
         prev = json.loads(PAIRED.read_text()).get("paired", []) if PAIRED.exists() else []
     except ValueError:
         pass
-    PAIRED.write_text(json.dumps({"paired": sorted(set(prev) | set(done))}) + "\n")
+    write_atomic(PAIRED, json.dumps({"paired": sorted(set(prev) | set(done))}) + "\n", 0o640)
 
     say("== step 3/3: enable and start the service")
     start_service(restart=cfg_changed or env_changed or a.restart)
@@ -607,7 +642,7 @@ def configured_sources() -> str:
 def status_summary() -> None:
     """Rehearsal 2 N-07: setup ended with a ~5 KB single-line JSON dump. Print a few lines; the full
     report goes to a file (and `blurredbox-edge status` prints it again at any time)."""
-    r = as_service([str(PY), "-m", "edge_agent", "--config", str(CONFIG), "--status"], read_envfile(ENVFILE),
+    r = as_service([str(PY), "-I", "-m", "edge_agent", "--config", str(CONFIG), "--status"], read_envfile(ENVFILE),
                    capture_output=True, text=True)
     out = (r.stdout or "").strip()
     try:
@@ -620,7 +655,7 @@ def status_summary() -> None:
     try:
         write_atomic(SETUP_STATUS, json.dumps(rep, indent=2, sort_keys=True, default=str) + "\n", 0o640)
         where = str(SETUP_STATUS)
-    except OSError:
+    except (OSError, Fail):
         where = ""
     spool = rep.get("spool") or {}
     say(f"service      : running ({SERVICE})")
@@ -673,7 +708,7 @@ def cmd_check(a: argparse.Namespace) -> int:
 
 
 def cmd_status(a: argparse.Namespace) -> int:
-    r = as_service([str(PY), "-m", "edge_agent", "--config", str(CONFIG), "--status"], read_envfile(ENVFILE),
+    r = as_service([str(PY), "-I", "-m", "edge_agent", "--config", str(CONFIG), "--status"], read_envfile(ENVFILE),
                    capture_output=True, text=True)
     say((r.stdout or r.stderr).strip())
     return r.returncode
@@ -688,7 +723,7 @@ def cmd_version(a: argparse.Namespace) -> int:
 def cmd_replay(rest: list[str]) -> int:
     """The history replay kit, from the installed wheel (no repository checkout). It runs as the calling
     user, not the service user: it reads the export the user points it at and writes only under --out."""
-    return subprocess.call([str(PY), "-m", "edge_agent.history_replay", *rest])
+    return subprocess.call([str(PY), "-I", "-m", "edge_agent.history_replay", *rest])
 
 
 def cmd_replay_rejected(rest: list[str]) -> int:
@@ -703,14 +738,14 @@ def cmd_replay_rejected(rest: list[str]) -> int:
         stop = f"sc.exe stop {SERVICE}" if IS_WIN else f"systemctl stop {SERVICE}"
         raise Fail(f"the {SERVICE} service is running; stop it first ({stop}), run the replay, then start it "
                    "again; or pass --while-running")
-    return as_service([str(PY), "-m", "edge_agent", "replay-rejected", "--config", str(CONFIG), *rest],
+    return as_service([str(PY), "-I", "-m", "edge_agent", "replay-rejected", "--config", str(CONFIG), *rest],
                       read_envfile(ENVFILE)).returncode
 
 
 def cmd_partner_api(argv: list[str]) -> int:
     """`incident ...` / `erase ...`: one signed call with the agent's config, client certificate and agent.env
     (secret and API key stay in the environment), as the service user that can read the key files."""
-    return as_service([str(PY), "-m", "edge_agent", argv[0], *argv[1:], "--config", str(CONFIG)],
+    return as_service([str(PY), "-I", "-m", "edge_agent", argv[0], *argv[1:], "--config", str(CONFIG)],
                       read_envfile(ENVFILE)).returncode
 
 
@@ -744,7 +779,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] in (["incident"], ["erase"]):   # its own argparse in the package (edge_agent/partner_api.py)
         if argv[:1] == ["incident"] and (len(argv) < 2 or argv[1].startswith("-")):
-            return subprocess.call([str(PY), "-m", "edge_agent", *argv])     # usage / --help
+            return subprocess.call([str(PY), "-I", "-m", "edge_agent", *argv])     # usage / --help
         return cmd_partner_api(argv)
     if argv[:1] == ["replay"]:                  # its own argparse (validate / send) in the package
         return cmd_replay(argv[1:])
