@@ -36,7 +36,7 @@ def _utc(epoch: float) -> datetime:
 def _agent(tmp_path, sim, **over) -> tuple[EdgeAgent, Collector]:
     sink = Collector()
     cfg = EdgeConfig(tenant_id=TENANT, install_id="demoseed-retail", models={SPEC.name: "mid-retail"},
-                     secret="labels-test-not-a-secret", endpoints=["http://stub.invalid"], state_dir=tmp_path / "edge",
+                     secret="labels-test-not-a-secret", endpoints=["https://stub.invalid"], state_dir=tmp_path / "edge",
                      cadence_seconds=SPEC.demo_cadence_seconds, output_kind="probability", timeout_seconds=5.0,
                      **over)
     return EdgeAgent(cfg, [], clock=lambda: _utc(sim[0]), post=sink), sink
@@ -121,6 +121,6 @@ def test_status_reports_the_open_condition(tmp_path):
 @pytest.mark.parametrize("bad", [-1, 1.5, "6", True])
 def test_bad_k_is_refused(tmp_path, bad):
     with pytest.raises(ValueError, match="labels_missing_after_windows"):
-        EdgeConfig(tenant_id=TENANT, install_id="x", models={"m": "mid"}, secret="s", endpoints=["http://e.invalid"],
+        EdgeConfig(tenant_id=TENANT, install_id="x", models={"m": "mid"}, secret="s", endpoints=["https://e.invalid"],
                    state_dir=tmp_path, labels_missing_after_windows=bad)
 

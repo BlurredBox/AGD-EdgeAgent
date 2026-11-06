@@ -5,6 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
+from urllib.parse import urlsplit
+
+
+def require_https_or_loopback(url: str) -> None:
+    """The API key, signature and pairing code must not travel in clear: https, or plain http to a literal loopback
+    host (local dev / test consoles)."""
+    u = urlsplit(str(url))
+    if u.scheme.lower() == "https" or (u.scheme.lower() == "http" and u.hostname in ("127.0.0.1", "::1", "localhost")):
+        return
+    raise ValueError("endpoints must be https:// URLs (the API key and signature must not travel in clear)")
 
 
 @dataclass
@@ -84,6 +94,8 @@ class EdgeConfig:
 
     def __post_init__(self) -> None:
         self.state_dir = Path(self.state_dir)
+        for ep in self.endpoints:
+            require_https_or_loopback(ep)
         if self.client_cert is not None:
             if (not isinstance(self.client_cert, (tuple, list)) or len(self.client_cert) != 2
                     or not all(isinstance(path, str) and path.strip() for path in self.client_cert)):
