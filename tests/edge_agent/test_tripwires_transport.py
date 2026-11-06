@@ -273,7 +273,7 @@ def test_healthy_model_does_not_reset_a_failing_models_backoff_or_signal_recover
         agent.sender.drain(force=True)
         assert agent.sender._fails == {"mA": i + 1} and agent.sender._link_down
     assert "link_recovered" not in kinds(agent)
-    assert agent.sender._retry_at["mA"] > clock[0].timestamp()
+    assert agent.sender._retry_at["mA"] > agent.sender._monotonic()
     sink.down = ()
     agent.sender.drain(force=True)
     assert "link_recovered" in kinds(agent) and agent.sender._fails == {}

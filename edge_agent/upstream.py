@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from edge_agent.config import require_https_or_loopback
 from edge_agent.mapping import ConfigError
 
 UPSTREAM_PATH = "/api/v1/ingest/signal/upstream-events"
@@ -202,7 +203,11 @@ class AirflowSource(_Base):
         if extra:
             raise ConfigError(f"{where}: unknown key(s) {extra}")
         base = spec.get("base_url")
-        if not isinstance(base, str) or not base.startswith(("https://", "http://127.0.0.1", "http://localhost")):
+        try:
+            require_https_or_loopback(base)
+        except (ValueError, TypeError, AttributeError):
+            base = None
+        if not isinstance(base, str):
             raise ConfigError(f"{where}.base_url must be an https:// URL (plain http only for localhost)")
         dags = spec.get("dag_ids")
         if (not isinstance(dags, list) or not dags or len(dags) > 50

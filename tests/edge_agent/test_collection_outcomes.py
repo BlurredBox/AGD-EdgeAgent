@@ -295,7 +295,7 @@ def test_computation_failure_is_visible_unsealed_and_does_not_log_raw_exception(
     agent.flush()
     model = agent.models[LOCAL_MODEL]
     assert model.failed == 1 and model.emitted == 0
-    assert model.collection["disposition"] == "computation_failed_requires_local_source_replay"
+    assert model.collection["disposition"] == "computation_failed_rows_quarantined"
     assert agent.outcomes.db.execute("SELECT emitted FROM predictions").fetchone()[0] == 0
     captured = capsys.readouterr()
     text = captured.out + captured.err + (agent.cfg.state_dir / "alerts.jsonl").read_text()

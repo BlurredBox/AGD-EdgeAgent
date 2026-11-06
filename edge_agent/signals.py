@@ -91,7 +91,7 @@ class ModelSignals:
         # output sd. Slice keys are partner values: local state only, never on the wire.
         self.ref_slice_acc: dict[str, list[float]] = {}
         self.ref_output_sd: float | None = None
-        self._rng = random.Random(cfg.seed)
+        self._rng = random.Random(cfg.seed)  # noqa: S311 -- seeded subsampling, not security
         self._load()
 
     # -- persistence (local only; raw reference rows live on the partner's disk) ----
@@ -102,7 +102,7 @@ class ModelSignals:
     def _load(self) -> None:
         try:
             with open(self.state_path, "rb") as fh:
-                saved = pickle.load(fh)           # our own 0600 file on the partner's disk
+                saved = pickle.load(fh)  # noqa: S301 -- our own 0600 file on the partner's disk
         except FileNotFoundError:
             return                                # first start
         except Exception as exc:                  # noqa: BLE001 -- truncated, corrupt, or an incompatible class
@@ -189,7 +189,7 @@ class ModelSignals:
                             and r.outcome_observed_at <= win.end and 0 <= r.output <= 1 for r in recs)):
                 calibrated = self._subsample(recs)  # same rows as the other harness statistics
                 probs, labels = [r.output for r in calibrated], [r.outcome for r in calibrated]
-                pairs = list(zip(probs, labels))
+                pairs = list(zip(probs, labels, strict=True))
                 z.update({"brier": sv.brier(probs, labels), "nll": sv.nll(probs, labels),
                           "ece": sv.ece(pairs), "mce": sv.mce(pairs)})
                 accuracy = sum((p >= 0.5) == bool(y) for p, y in pairs) / len(pairs)

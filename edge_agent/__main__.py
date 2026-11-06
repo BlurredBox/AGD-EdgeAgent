@@ -228,8 +228,13 @@ def main() -> None:
         if report["verdict"] not in PASSING_VERDICTS:
             raise SystemExit(2)
         return
-    EdgeAgent(cfg, adapters, required_spec=required, outcome_sources=outcomes,
-              proxy_sources=proxies, upstream_sources=upstream).run_forever()
+    from edge_agent.featureids import FeatureIdSaltError
+    try:
+        agent = EdgeAgent(cfg, adapters, required_spec=required, outcome_sources=outcomes,
+                          proxy_sources=proxies, upstream_sources=upstream)
+    except FeatureIdSaltError as exc:
+        ap.error(str(exc))
+    agent.run_forever()
 
 
 def _trusted_bundle(directory: str, digest: str | None):

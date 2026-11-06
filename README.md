@@ -19,7 +19,7 @@ Windows is not supported. `packaging/edge_agent/installer/windows/` ships an ins
 
 ## Status
 
-Early stage. This repository mirrors the edge agent from BlurredBox `dev` at `de4b9ea24` (after release `v0.0.2-rc6`, before rc7; it carries the 2026-11-04 audit fixes) with `scripts/release_from_agd.py`. The agent needs the BlurredBox SDK (`blurredbox_agd`), which is not on a public index; without it, and without the server code some tests import, those tests skip. To report a security problem see `SECURITY.md`.
+Early stage. This repository mirrors the edge agent from BlurredBox `dev` at `838946898` (after release `v0.0.2-rc6`, before rc7; it carries the 2026-11-04 audit fixes) with `scripts/release_from_agd.py`. The agent needs the BlurredBox SDK (`blurredbox_agd`), which is not on a public index; without it, and without the server code some tests import, those tests skip. To report a security problem see `SECURITY.md`.
 
 ## Install
 

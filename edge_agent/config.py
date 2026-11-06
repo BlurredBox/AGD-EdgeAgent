@@ -8,6 +8,11 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
+def _safe(s: str) -> str:
+    """Folder-name form of a model or window id (spool, models/ state)."""
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in s)[:96]
+
+
 def require_https_or_loopback(url: str) -> None:
     """The API key, signature and pairing code must not travel in clear: https, or plain http to a literal loopback
     host (local dev / test consoles). scripts/partner_pair.py ships standalone in the kit and carries its own copy."""
@@ -108,8 +113,9 @@ class EdgeConfig:
             raise ValueError("future_tolerance_seconds must be a number >= 0")
         if self.output_kind not in ("signed", "probability"):
             raise ValueError("output_kind must be 'signed' or 'probability'")
-        if self.cadence_seconds < 1 or self.reference_windows < 1:
-            raise ValueError("cadence_seconds and reference_windows must be >= 1")
+        for name in ("cadence_seconds", "reference_windows", "slice_min_rows", "slice_max"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"{name} must be an integer >= 1")
         if not self.models:
             raise ValueError("at least one model must be configured")
         if (type(self.outcome_join_max_records) is not int or self.outcome_join_max_records < 1
@@ -117,7 +123,7 @@ class EdgeConfig:
             raise ValueError("outcome join capacity and retention must be positive")
         if self.arrival_stamp not in ("ingest", "source_only"):
             raise ValueError("arrival_stamp must be 'ingest' or 'source_only'")
-        if not (0 <= self.null_rate_ceiling < 1) or self.slice_min_rows < 1 or self.slice_max < 1 \
+        if not (0 <= self.null_rate_ceiling < 1) \
                 or not (math.isfinite(self.slice_shift_limit) and self.slice_shift_limit > 0):
             raise ValueError("null_rate_ceiling in [0, 1), slice_min_rows and slice_max >= 1, "
                              "slice_shift_limit > 0")
@@ -137,17 +143,56 @@ class EdgeConfig:
         for name in ("min_rows_per_window", "reference_max_rows", "max_rows_per_window"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be an integer >= 1")
+        # An empty secret is refused by the CLI loader when it signs; dry runs (--check/--status) build the config
+        # with secret="" (__main__.py load_edge_config), so it cannot be refused here yet.
         if not isinstance(self.secret, (str, bytes)):
             raise ValueError("secret must be a string")
+        for name in ("tenant_id", "install_id", "schema_version"):
+            v = getattr(self, name)
+            if not isinstance(v, str) or not v.strip():
+                raise ValueError(f"{name} must be a nonempty string")
+        if (not isinstance(self.endpoints, (list, tuple)) or not self.endpoints
+                or not all(isinstance(e, str) for e in self.endpoints)):
+            raise ValueError("endpoints must be a nonempty list of URLs")
+        if not str(self.state_dir) or str(self.state_dir) == ".":
+            raise ValueError("state_dir must be a nonempty path")
+        if (not isinstance(self.instrument_series, dict)
+                or not all(isinstance(k, str) and k and isinstance(v, str) and v.strip()
+                           for k, v in self.instrument_series.items())):
+            raise ValueError("instrument_series must map instrument names to nonempty series ids")
+        if type(self.price_max_staleness_days) is not int or self.price_max_staleness_days < 0:
+            raise ValueError("price_max_staleness_days must be an integer >= 0")
+        v = self.max_invalid_row_fraction
+        if not (isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 1):
+            raise ValueError("max_invalid_row_fraction must be a number in [0, 1]")
+        for name in ("feed_down_after_seconds", "backlog_after_seconds"):
+            v = getattr(self, name)
+            if v is not None and not (isinstance(v, (int, float)) and not isinstance(v, bool)
+                                      and math.isfinite(v) and v > 0):
+                raise ValueError(f"{name} must be a positive number (or None for the default)")
+        if not isinstance(self.feature_bounds, dict):
+            raise ValueError("feature_bounds must map feature names to (lo, hi)")
+        pairs = list(self.feature_bounds.values()) + ([self.output_bounds] if self.output_bounds is not None else [])
+        for b in pairs:
+            if (not isinstance(b, (tuple, list)) or len(b) != 2
+                    or not all(isinstance(x, (int, float)) and not isinstance(x, bool) and x == x for x in b)
+                    or b[0] > b[1]):
+                raise ValueError("feature_bounds and output_bounds must be (lo, hi) numbers with lo <= hi")
         if (not isinstance(self.models, dict)
                 or not all(isinstance(k, str) and k and isinstance(v, str) and v.strip()
                            for k, v in self.models.items())):
             raise ValueError("models must map nonempty local model ids to nonempty BlurredBox model ids")
+        seen: dict[str, str] = {}
+        for wire in dict.fromkeys(self.models.values()):    # spool and state folders are named by the wire id
+            if (other := seen.setdefault(_safe(wire), wire)) != wire:
+                raise ValueError(f"models {other!r} and {wire!r} share the folder name {_safe(wire)!r}; "
+                                 "their spooled windows would overwrite each other. Use ids that differ in "
+                                 "letters, digits, '-' or '_' within the first 96 characters")
         for name in ("timeout_seconds", "spool_max_age_seconds"):
             v = getattr(self, name)
             if not (isinstance(v, (int, float)) and math.isfinite(v) and v > 0):
                 raise ValueError(f"{name} must be a positive number")
         for name in ("lateness_seconds", "alert_cooldown_seconds"):
             v = getattr(self, name)
-            if not (isinstance(v, (int, float)) and math.isfinite(v) and v >= 0):
+            if not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0):
                 raise ValueError(f"{name} must be a number >= 0")

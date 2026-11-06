@@ -27,7 +27,7 @@ from edge_agent.upstream import MAX_EVENTS_PER_POST, UPSTREAM_PATH
 from edge_agent.status import STATUS_FILE
 from corpus import onboarding
 from edge_agent.signals import ModelSignals, WindowInput
-from edge_agent.transport import DurableSpool, Sender
+from edge_agent.transport import DurableSpool, Sender, _safe
 from edge_agent.tripwires import (FEED_DOWN, FEED_RECOVERED, LABELS_MISSING, LABELS_RECOVERED, REJECTED,
                                   SCHEMA_BREAK, LocalAlert, LocalAlerter, RecordGuard)
 from edge_agent.windows import ClosedWindow, WindowCutter
@@ -107,11 +107,6 @@ class EdgeAgent:
         self.prices = prices
         self.alerter = LocalAlerter(sd / "alerts.jsonl", cfg.alert_cooldown_seconds)
         self.ids = FeatureIdMap(sd / "feature_ids.json")
-        if self.ids.salt_regenerated:
-            self.alerter.raise_alert(
-                REJECTED, "*", "feature_ids.json was unreadable and no backup could be read: every feature id "
-                "changed (the old file is kept as feature_ids.corrupt-<time>); server-side per-feature series restart",
-                key="feature_salt")
         self._check_cadence_marker(sd)
         self._housekeeping_at = float("-inf")
         self.sender = Sender(cfg, DurableSpool(sd / "spool"), self.alerter,
@@ -503,6 +498,25 @@ class EdgeAgent:
         if not self._restored_upto:
             self._open_file.unlink(missing_ok=True)
 
+    # -- a closed window that cannot be computed or sent ---------------------------------
+    # ponytail: quarantine/ is not trimmed (ceiling: grows with failed windows; upgrade: add it to trim_spool housekeeping)
+    def _quarantine(self, m: _ModelRuntime, win: ClosedWindow, reason: str, exc: Exception) -> str | None:
+        """Keep the rows of a failed window on local disk (never sent); returns the path, None if the write failed."""
+        path = self.cfg.state_dir / "quarantine" / _safe(self.cfg.models[m.model_id]) / f"{win.end.strftime('%Y%m%dT%H%M%SZ')}.json"
+        try:
+            write_json_atomic(path, {"model_id": m.model_id, "window_start": win.start.isoformat(),
+                                     "window_end": win.end.isoformat(), "reason": reason,
+                                     "error_type": type(exc).__name__,
+                                     "records": [record_to_json(r) for r in win.records]})
+        except OSError:
+            collection_log.error("window_quarantine_failed", reason=reason)
+            return None
+        return str(path)
+
+    @staticmethod
+    def _quarantine_note(where: str | None) -> str:
+        return f"rows kept locally in {where}" if where else "rows LOST (quarantine write failed)"
+
     # -- one closed window ----------------------------------------------------------
     def _window(self, m: _ModelRuntime, win: ClosedWindow) -> None:
         done = self._emitted_end.get(m.model_id)
@@ -529,12 +543,13 @@ class EdgeAgent:
             z = m.signals.process(wi, self.ops_provider)
         except Exception as exc:                  # noqa: BLE001 -- one bad window must not stop the agent
             m.failed += 1
-            m.collection = {"disposition": "computation_failed_requires_local_source_replay",
-                            "outcome_metrics_available": False}
+            where = self._quarantine(m, win, "computation_failed", exc)
+            m.collection = {"disposition": "computation_failed_rows_quarantined" if where
+                            else "computation_failed_rows_lost", "outcome_metrics_available": False}
             collection_log.error("collection_computation_failed", error_type=type(exc).__name__)
             self.alerter.raise_alert(REJECTED, m.model_id,
-                                     f"z_t computation failed ({type(exc).__name__}); local source replay required",
-                                     key="compute")
+                                     f"z_t computation failed ({type(exc).__name__}); "
+                                     + self._quarantine_note(where), key="compute")
             return
         m.last_window_end = win.end.isoformat()
         labelled = sum(r.outcome is not None for r in win.records)
@@ -570,8 +585,11 @@ class EdgeAgent:
                 window_end=win.end, z_t=wire_z)
         except WireViolation as exc:
             m.failed += 1
-            m.collection["disposition"] = "wire_rejected_requires_local_source_replay"
-            self.alerter.raise_alert(REJECTED, m.model_id, f"payload failed the wire audit: {exc}",
+            where = self._quarantine(m, win, "wire_rejected", exc)
+            m.collection["disposition"] = ("wire_rejected_rows_quarantined" if where
+                                           else "wire_rejected_rows_lost")
+            self.alerter.raise_alert(REJECTED, m.model_id,
+                                     f"payload failed the wire audit: {exc}; " + self._quarantine_note(where),
                                      key="audit")
             return
         try:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +30,8 @@ from typing import Any, Callable
 
 from blurredbox_agd.ingest import SIGNAL_PATH, IngestError, IngestTransport
 
-from edge_agent.config import EdgeConfig
+from edge_agent.checkpoint import write_json_atomic
+from edge_agent.config import EdgeConfig, _safe
 from edge_agent.tripwires import LINK_DOWN, LINK_RECOVERED, REJECTED, LocalAlerter
 
 log = logging.getLogger("edge_agent.transport")
@@ -61,6 +63,9 @@ class DurableSpool:
         d = self.root / _safe(model)
         d.mkdir(parents=True, exist_ok=True)
         stem = f"{int(window_end.timestamp() * 1000):015d}-{_safe(str(body.get('window_id', '')))}"
+        legacy = d / f"{int(window_end.timestamp() * 1000):015d}.json"    # rc6 name, no window id
+        if legacy.exists() and self._same_window(legacy, body):
+            return legacy
         path, n = d / f"{stem}.json", 1
         while path.exists():                     # never overwrite an unsent window
             if self._same_window(path, body):
@@ -103,9 +108,7 @@ class DurableSpool:
 
     def bump(self, path: Path, entry: dict[str, Any]) -> None:
         entry["attempts"] = entry.get("attempts", 0) + 1
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(entry, sort_keys=True))
-        os.replace(tmp, path)
+        write_json_atomic(path, entry)
 
     def reject(self, path: Path, rejection: dict[str, Any] | None = None) -> Path:
         """Move a window out of the queue. With `rejection` (the backend's answer), the moved
@@ -158,10 +161,6 @@ def is_operator_fault(exc: IngestError) -> bool:
                for _, code, reason in exc.errors)
 
 
-def _safe(s: str) -> str:
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in s)[:96]
-
-
 @dataclass
 class SendStats:
     sent: int = 0
@@ -176,7 +175,8 @@ class SendStats:
 
 class Sender:
     def __init__(self, cfg: EdgeConfig, spool: DurableSpool, alerter: LocalAlerter, *,
-                 post: Callable | None = None, clock: Callable[[], datetime] | None = None) -> None:
+                 post: Callable | None = None, clock: Callable[[], datetime] | None = None,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
         self.cfg, self.spool, self.alerter = cfg, spool, alerter
         self.transport = IngestTransport(
             cfg.endpoints, secret=cfg.secret, tenant_id=cfg.tenant_id,
@@ -186,6 +186,8 @@ class Sender:
             client_cert=cfg.client_cert, ca_file=cfg.ca_file)
         self.stats = SendStats()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._monotonic = monotonic                # backoff only: a wall-clock step must not freeze retries
+        self._wall_vouched = False                 # an accepted signed send this run (see expiry below)
         self._fails: dict[str, int] = {}          # consecutive link failures per model
         self._retry_at: dict[str, float] = {}
         self._link_down = False
@@ -200,11 +202,11 @@ class Sender:
     def drain(self, *, force: bool = False) -> int:
         """Send what is queued, oldest first within a model. A retryable failure stops only that
         model's queue (order inside it must hold); other models still drain. Returns accepted."""
-        now = self._clock()
+        now, mono = self._clock(), self._monotonic()
         sent, blocked = 0, False
         self._backlog_in_run = 0
         for model, paths in self.spool.queues().items():
-            if not force and now.timestamp() < self._retry_at.get(model, 0.0):
+            if not force and mono < self._retry_at.get(model, 0.0):
                 blocked = True
                 continue
             n, ok = self._drain_model(model, paths, now)
@@ -230,6 +232,21 @@ class Sender:
             end = datetime.fromisoformat(entry["end"])
             age = (now - end).total_seconds()
             if age > self.cfg.spool_max_age_seconds:
+                # ponytail: stateless guard. Expire only after the backend accepted a signed send in this
+                # process: the SDK signs with the wall clock and the server refuses a skewed timestamp, so
+                # an accept means the clock is roughly right. Until then a past-limit window is kept and
+                # skipped (it would only be expired later, so newer windows may overtake it), with an alert.
+                # Tells apart: an RTC years ahead at start (every send is refused, nothing is deleted) from a
+                # correct clock after a long outage (the first fresh window accepted unlocks expiry).
+                # Cannot tell apart: a forward step AFTER an accept in this run (expires as before); a
+                # backend that does not check the signing time; a run that cuts no fresh window and holds
+                # only past-limit ones (kept until one is cut). Upgrade: a server Date header from the SDK.
+                if not self._wall_vouched:
+                    self.alerter.raise_alert(REJECTED, entry["body"]["monitored_model_id"],
+                                             "queued window is past the offline queue limit by the wall "
+                                             "clock, but no send has confirmed that clock yet; kept",
+                                             key="expiry_held", age_seconds=age)
+                    continue
                 self.spool.remove(path)
                 self.stats.expired += 1
                 self.alerter.raise_alert(REJECTED, entry["body"]["monitored_model_id"],
@@ -253,6 +270,7 @@ class Sender:
                 return sent, False               # keep order: nothing behind this may overtake it
             sent += 1
             self.stats.sent += 1
+            self._wall_vouched = True
             if backlog:
                 self.stats.backlog_sent += 1
                 self._backlog_in_run += 1
@@ -264,7 +282,11 @@ class Sender:
         entry = self.spool.read(path)
         if not isinstance(entry["body"]["monitored_model_id"], str) or not entry["body"].get("window_id"):
             raise ValueError("incomplete body")
-        datetime.fromisoformat(entry["end"])
+        if datetime.fromisoformat(entry["end"]).tzinfo is None:
+            raise ValueError("naive end")
+        att = entry.get("attempts", 0)
+        if not isinstance(att, int) or isinstance(att, bool):
+            raise ValueError("bad attempts")
         return entry
 
     def _reject(self, path: Path, entry: dict[str, Any], exc: IngestError, now: datetime) -> None:
@@ -292,7 +314,7 @@ class Sender:
     def _link_failed(self, model: str) -> None:
         self.stats.transport_failures += 1
         n = self._fails[model] = self._fails.get(model, 0) + 1
-        self._retry_at[model] = self._clock().timestamp() + min(300.0, 5.0 * 2 ** min(n, 6))
+        self._retry_at[model] = self._monotonic() + min(300.0, 5.0 * 2 ** min(n, 6))
         if not self._link_down:
             self._link_down = True
             self.alerter.raise_alert(

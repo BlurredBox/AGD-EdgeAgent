@@ -130,7 +130,7 @@ class TDigest:
             return cs[0][0]
         if target >= centres[-1][0]:
             return cs[-1][0]
-        for (c0, m0), (c1, m1) in zip(centres, centres[1:]):
+        for (c0, m0), (c1, m1) in zip(centres, centres[1:], strict=False):
             if c0 <= target <= c1:
                 frac = (target - c0) / (c1 - c0) if c1 > c0 else 0.0
                 return m0 + (m1 - m0) * frac
@@ -164,7 +164,7 @@ class HyperLogLog:
     @staticmethod
     def _hash64(value) -> int:
         data = str(value).encode("utf-8")
-        return int.from_bytes(hashlib.sha1(data).digest()[:8], "big")
+        return int.from_bytes(hashlib.sha1(data, usedforsecurity=False).digest()[:8], "big")
 
     def add(self, value) -> None:
         h = self._hash64(value)
