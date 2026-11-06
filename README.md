@@ -13,7 +13,9 @@ Nothing else is sent. The code that assembles a payload is `edge_agent/wire.py`;
 
 ## Platform
 
-Linux (systemd or the container image) is the supported platform. The Windows service wrapper under `packaging/edge_agent/installer/windows/` is untested and not offered; on Windows the owner-only file modes are not enforced.
+Linux (systemd unit or the container image) is the supported platform.
+
+Windows is not supported. `packaging/edge_agent/installer/windows/` ships an installer (`install.ps1`) and a service wrapper that sends CTRL_BREAK on stop so the open window is kept, and the installer restricts `conf\` and `data\` with ACLs. None of it has been run on Windows. In the agent code itself the `0o600` file modes have no effect on Windows; only the installer's ACLs protect the state files, so a manual run there leaves them readable by other local users. Use it only for your own testing.
 
 ## Status
 
@@ -21,7 +23,7 @@ Early stage. This repository mirrors the edge agent from BlurredBox `dev` at `de
 
 ## Install
 
-Use the install kit you receive from BlurredBox; it installs offline with `--no-index` and does not use a public package index. Installer and service files are in `packaging/edge_agent/`.
+Use the install kit you receive from BlurredBox; it installs offline with `--no-index` and does not use a public package index. Installer and service files are in `packaging/edge_agent/`. Configuration is a JSON file (`python -m edge_agent --config agent.json`); the HMAC secret and BlurredBox API key come from the environment (`AGD_HMAC_SECRET`, `BLURREDBOX_API_KEY`) or the hidden prompt of `blurredbox-edge setup`. `blurredbox-edge check` inspects a sample of your input without sending anything.
 
 ## Licence
 
