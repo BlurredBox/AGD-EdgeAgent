@@ -35,10 +35,15 @@ from edge_agent.tripwires import LINK_DOWN, LINK_RECOVERED, REJECTED, LocalAlert
 log = logging.getLogger("edge_agent.transport")
 
 _RETRYABLE_4XX = {408, 425, 429}
+# 401/403/404 are credential or routing (wrong endpoint path) problems the operator can fix;
+# the window must survive them.
+_AUTH_4XX = {401, 403, 404}
+AUTH_FAILED = "backend_auth_failed"
+QUARANTINE_DIR = "quarantine"
 # Windows resent from `rejected/` by `edge_agent replay-rejected` land here with a receipt. Like
 # `rejected/`, it is not a model queue: `pending()` must never send from it again.
 REPLAYED_DIR = "replayed"
-_NOT_QUEUES = ("rejected", REPLAYED_DIR)
+_NOT_QUEUES = ("rejected", REPLAYED_DIR, QUARANTINE_DIR)
 
 
 class DurableSpool:
@@ -47,13 +52,18 @@ class DurableSpool:
         self.rejected = self.root / "rejected"
         self.root.mkdir(parents=True, exist_ok=True)
         self.rejected.mkdir(parents=True, exist_ok=True)
+        self.quarantine = self.root / QUARANTINE_DIR
 
     def put(self, body: dict[str, Any], window_end: datetime) -> Path:
         model = body["monitored_model_id"]
         d = self.root / _safe(model)
         d.mkdir(parents=True, exist_ok=True)
-        name = f"{int(window_end.timestamp() * 1000):015d}.json"
-        path = d / name
+        stem = f"{int(window_end.timestamp() * 1000):015d}-{_safe(str(body.get('window_id', '')))}"
+        path, n = d / f"{stem}.json", 1
+        while path.exists():                     # never overwrite an unsent window
+            if self._same_window(path, body):
+                return path
+            path, n = d / f"{stem}.{n}.json", n + 1
         tmp = path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as fh:
@@ -64,12 +74,27 @@ class DurableSpool:
         os.replace(tmp, path)
         return path
 
+    def _same_window(self, path: Path, body: dict[str, Any]) -> bool:
+        try:
+            return self.read(path)["body"].get("window_id") == body.get("window_id") is not None
+        except (OSError, ValueError, KeyError, AttributeError, TypeError):
+            return False
+
+    def queues(self) -> dict[str, list[Path]]:
+        """Oldest-first paths per model directory."""
+        return {d.name: sorted(d.glob("*.json")) for d in
+                sorted(p for p in self.root.iterdir() if p.is_dir() and p.name not in _NOT_QUEUES)}
+
+    def quarantine_file(self, path: Path) -> Path:
+        """Move an unusable spool file aside (kept for a human, never re-read)."""
+        self.quarantine.mkdir(parents=True, exist_ok=True)
+        dest = self.quarantine / f"{path.parent.name}-{path.name}"
+        os.replace(path, dest)
+        return dest
+
     def pending(self) -> list[Path]:
         """Oldest-first within each model."""
-        out: list[Path] = []
-        for d in sorted(p for p in self.root.iterdir() if p.is_dir() and p.name not in _NOT_QUEUES):
-            out += sorted(d.glob("*.json"))
-        return out
+        return [p for paths in self.queues().values() for p in paths]
 
     def read(self, path: Path) -> dict[str, Any]:
         return json.loads(path.read_text())
@@ -119,8 +144,16 @@ def is_deterministic(exc: IngestError) -> bool:
     """Every endpoint answered a 4xx that cannot succeed on retry (not 408/425/429)."""
     errs = exc.errors
     return bool(errs) and all(
-        code is not None and 400 <= code < 500 and code not in _RETRYABLE_4XX
-        for _, code, _ in errs)
+        code is not None and 400 <= code < 500 and code not in _RETRYABLE_4XX | _AUTH_4XX
+        and not (code == 422 and "invalid_window_time" in (reason or ""))
+        for _, code, reason in errs)
+
+
+def is_operator_fault(exc: IngestError) -> bool:
+    """Retried, but the operator must be told: auth refused, or the window close is ahead of the
+    server clock (`invalid_window_time`, clock skew)."""
+    return any(code in _AUTH_4XX or (code == 422 and "invalid_window_time" in (reason or ""))
+               for _, code, reason in exc.errors)
 
 
 def _safe(s: str) -> str:
@@ -132,6 +165,7 @@ class SendStats:
     sent: int = 0
     backlog_sent: int = 0
     rejected: int = 0
+    quarantined: int = 0
     expired: int = 0
     transport_failures: int = 0
     last_backlog_flush: int = 0
@@ -150,8 +184,8 @@ class Sender:
             client_cert=cfg.client_cert, ca_file=cfg.ca_file)
         self.stats = SendStats()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._fails = 0
-        self._retry_at = 0.0
+        self._fails: dict[str, int] = {}          # consecutive link failures per model
+        self._retry_at: dict[str, float] = {}
         self._link_down = False
         self._backlog_in_run = 0
 
@@ -162,18 +196,34 @@ class Sender:
         return len(self.spool.pending())
 
     def drain(self, *, force: bool = False) -> int:
-        """Send what is queued, oldest first. Returns how many were accepted."""
+        """Send what is queued, oldest first within a model. A retryable failure stops only that
+        model's queue (order inside it must hold); other models still drain. Returns accepted."""
         now = self._clock()
-        if not force and now.timestamp() < self._retry_at:
-            return 0
-        sent = 0
+        sent, blocked = 0, False
         self._backlog_in_run = 0
-        for path in self.spool.pending():
+        for model, paths in self.spool.queues().items():
+            if not force and now.timestamp() < self._retry_at.get(model, 0.0):
+                blocked = True
+                continue
+            n, ok = self._drain_model(model, paths, now)
+            sent += n
+            blocked = blocked or not ok
+            if ok:                                   # only this model's backoff resets
+                self._fails.pop(model, None)
+                self._retry_at.pop(model, None)
+        if not self._fails and (sent or (not blocked and not self.spool.pending())):
+            self._link_ok()
+        return sent
+
+    def _drain_model(self, model: str, paths: list[Path], now: datetime) -> tuple[int, bool]:
+        sent = 0
+        for path in paths:
             try:
-                entry = self.spool.read(path)
-            except (OSError, ValueError):
-                self.spool.reject(path)
-                self.stats.rejected += 1
+                entry = self._load(path)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                self.spool.quarantine_file(path)
+                self.stats.quarantined += 1
+                log.error("spool_quarantined file=%s error=%s", path.name, repr(exc)[:200])
                 continue
             end = datetime.fromisoformat(entry["end"])
             age = (now - end).total_seconds()
@@ -189,35 +239,49 @@ class Sender:
                 self.transport.send(SIGNAL_PATH, entry["body"])
             except IngestError as exc:
                 if self._deterministic(exc):
-                    answers = answers_of(exc)
-                    body = entry["body"]
-                    self.spool.reject(path, {"at": now.isoformat(), "answers": answers})
-                    self.stats.rejected += 1
-                    self.stats.reasons.append(str(exc)[:200])
-                    # The answer goes in the log line too: the alert file is not always kept,
-                    # and "refused" without the status cannot be explained afterwards.
-                    log.warning("window_rejected model=%s window=%s http=%s reason=%s",
-                                body["monitored_model_id"], body.get("window_id"),
-                                ",".join(str(a["status"]) for a in answers),
-                                " | ".join(a["reason"] for a in answers)[:300])
-                    self.alerter.raise_alert(
-                        REJECTED, body["monitored_model_id"],
-                        "backend refused a window deterministically; moved to rejected/",
-                        key=body["window_id"], error=str(exc)[:300],
-                        http_status=[a["status"] for a in answers])
+                    self._reject(path, entry, exc, now)
                     continue
                 self.spool.bump(path, entry)
-                self._link_failed(entry["body"]["monitored_model_id"])
-                return sent                      # keep order: nothing behind this may overtake it
+                if is_operator_fault(exc):
+                    self.alerter.raise_alert(
+                        AUTH_FAILED, model, "backend refused credentials, route or window time; "
+                        "windows stay queued and are retried", key="auth",
+                        error=str(exc)[:300], http_status=[a["status"] for a in answers_of(exc)])
+                self._link_failed(model)
+                return sent, False               # keep order: nothing behind this may overtake it
             sent += 1
             self.stats.sent += 1
             if backlog:
                 self.stats.backlog_sent += 1
                 self._backlog_in_run += 1
             self.spool.remove(path)
-        if sent or not self.spool.pending():
-            self._link_ok()
-        return sent
+        return sent, True
+
+    def _load(self, path: Path) -> dict[str, Any]:
+        """Read and validate a spool entry; raises if it is not a complete window."""
+        entry = self.spool.read(path)
+        if not isinstance(entry["body"]["monitored_model_id"], str) or not entry["body"].get("window_id"):
+            raise ValueError("incomplete body")
+        datetime.fromisoformat(entry["end"])
+        return entry
+
+    def _reject(self, path: Path, entry: dict[str, Any], exc: IngestError, now: datetime) -> None:
+        answers = answers_of(exc)
+        body = entry["body"]
+        self.spool.reject(path, {"at": now.isoformat(), "answers": answers})
+        self.stats.rejected += 1
+        self.stats.reasons.append(str(exc)[:200])
+        # The answer goes in the log line too: the alert file is not always kept,
+        # and "refused" without the status cannot be explained afterwards.
+        log.warning("window_rejected model=%s window=%s http=%s reason=%s",
+                    body["monitored_model_id"], body.get("window_id"),
+                    ",".join(str(a["status"]) for a in answers),
+                    " | ".join(a["reason"] for a in answers)[:300])
+        self.alerter.raise_alert(
+            REJECTED, body["monitored_model_id"],
+            "backend refused a window deterministically; moved to rejected/",
+            key=body["window_id"], error=str(exc)[:300],
+            http_status=[a["status"] for a in answers])
 
     @staticmethod
     def _deterministic(exc: IngestError) -> bool:
@@ -225,8 +289,8 @@ class Sender:
 
     def _link_failed(self, model: str) -> None:
         self.stats.transport_failures += 1
-        self._fails += 1
-        self._retry_at = self._clock().timestamp() + min(300.0, 5.0 * 2 ** min(self._fails, 6))
+        n = self._fails[model] = self._fails.get(model, 0) + 1
+        self._retry_at[model] = self._clock().timestamp() + min(300.0, 5.0 * 2 ** min(n, 6))
         if not self._link_down:
             self._link_down = True
             self.alerter.raise_alert(
@@ -234,8 +298,6 @@ class Sender:
                 key="link", queued=self.pending_count())
 
     def _link_ok(self) -> None:
-        self._fails = 0
-        self._retry_at = 0.0
         if self._link_down:
             self._link_down = False
             self.stats.last_backlog_flush = self._backlog_in_run
