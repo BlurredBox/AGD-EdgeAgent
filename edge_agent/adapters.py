@@ -5,6 +5,7 @@ into `Record`s. The agent only ever calls `poll()`; adapters must not block.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -67,9 +68,15 @@ class InProcessAdapter(SourceAdapter):
         return out
 
 
+# ponytail: the head hash catches copytruncate (same inode); a new file whose first HEAD_BYTES equal the old one's
+# is not told apart. Rows left unread in a renamed-away file are not chased.
+HEAD_BYTES = 256
+
+
 class JsonlTailAdapter(SourceAdapter):
     """Tails a JSON-lines file; the byte offset is persisted so a restart neither
-    replays nor skips lines. Rotation/truncation (file shrank) restarts at 0.
+    replays nor skips lines. Rotation restarts at 0 (audit F13): a new inode, a changed
+    head (copytruncate), a shrunk file, or a saved offset that is not at a line end.
 
     Default line shape: {"ts", "model_id", "instrument", "features": {...}, "output"}.
     `parse` can map any other shape to those five keys. Unparseable lines are
@@ -81,9 +88,17 @@ class JsonlTailAdapter(SourceAdapter):
         self.path, self.offset_file = Path(path), Path(offset_file)
         self.parse = parse
         self.bad_lines = 0
+        self.rotations = 0
+        # "<inode>:<sha256 of the first min(offset, HEAD_BYTES) bytes>", beside the offset file (which stays a bare int)
+        self._ident_file = self.offset_file.with_name(self.offset_file.name + ".id")
+        self._ident: str | None = None
         self._offset = self._load_offset()
 
     def _load_offset(self) -> int:
+        try:
+            self._ident = self._ident_file.read_text().strip() or None
+        except OSError:
+            self._ident = None             # no identity saved yet (older agent): the line-end check still applies
         try:
             return int(self.offset_file.read_text().strip() or 0)
         except (OSError, ValueError):
@@ -94,16 +109,34 @@ class JsonlTailAdapter(SourceAdapter):
         tmp = self.offset_file.with_suffix(".tmp")
         tmp.write_text(str(self._offset))
         os.replace(tmp, self.offset_file)
+        if self._ident:                    # after the offset: a crash between the two re-reads from 0, never skips
+            tmp.write_text(self._ident)
+            os.replace(tmp, self._ident_file)
+
+    def _identity(self, fh, ino: int) -> str:
+        fh.seek(0)
+        return f"{ino}:{hashlib.sha256(fh.read(min(self._offset, HEAD_BYTES))).hexdigest()}"
+
+    def _rotated(self, fh, st: os.stat_result) -> bool:
+        """The saved offset does not belong to this file, so resuming there would skip rows or start mid-line."""
+        if self._offset == 0:
+            return False
+        if st.st_size < self._offset or (self._ident is not None and self._ident != self._identity(fh, st.st_ino)):
+            return True
+        fh.seek(self._offset - 1)
+        return fh.read(1) != b"\n"
 
     def poll(self, max_records: int = 10_000) -> list[Record]:
         try:
-            size = self.path.stat().st_size
+            fh = open(self.path, "rb")
         except OSError:
             return []                      # file absent: the feed-down tripwire reports it
-        if size < self._offset:
-            self._offset = 0
         out: list[Record] = []
-        with open(self.path, "rb") as fh:
+        with fh:
+            st = os.fstat(fh.fileno())     # the inode of the file actually read, not of a path renamed meanwhile
+            if self._rotated(fh, st):
+                self._offset = 0
+                self.rotations += 1
             fh.seek(self._offset)
             while len(out) < max_records:
                 line = fh.readline()
@@ -122,11 +155,12 @@ class JsonlTailAdapter(SourceAdapter):
                                            outcome_observed_at=d.get("outcome_observed_at")))
                 except Exception:          # noqa: BLE001 -- counted, never raised
                     self.bad_lines += 1
+            self._ident = self._identity(fh, st.st_ino)
         self._save_offset()
         return out
 
     def describe(self) -> dict:
-        return {"type": "jsonl", "offset": self._offset, "bad_lines": self.bad_lines}
+        return {"type": "jsonl", "offset": self._offset, "bad_lines": self.bad_lines, "rotations": self.rotations}
 
     def sample(self, limit: int = 1000) -> Sample:
         """Parse up to `limit` non-blank lines from the start of the file; no offset is written."""
