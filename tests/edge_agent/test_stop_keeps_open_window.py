@@ -7,8 +7,11 @@ restart, under systemd and in the container alike. Now the running service keeps
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import timedelta
+
+import pytest
 
 from edge_agent import EdgeAgent
 from edge_agent.adapters import JsonlTailAdapter
@@ -85,7 +88,7 @@ def test_a_window_already_queued_is_not_restored_twice(tmp_path):
     agent.close(keep_open=True)
     saved = (cfg.state_dir / OPEN_WINDOWS_FILE).read_text()
     agent2 = EdgeAgent(cfg, post=Collector(), clock=lambda: clock[0])
-    clock[0] = utc(T0 + CADENCE + 1)
+    clock[0] = utc(T0 + CADENCE + 1 + cfg.lateness_seconds)
     agent2.tick(clock[0])                          # window 0 is queued; the emitted watermark moves
     (cfg.state_dir / OPEN_WINDOWS_FILE).write_text(saved)   # as if the process died before removing the file
     sink3 = Collector()
@@ -122,7 +125,7 @@ def test_jsonl_offset_and_kept_rows_together_lose_nothing_and_repeat_nothing(tmp
     with log.open("a") as fh:                      # the model writes on while the agent is stopped
         for r in recs[14:]:
             fh.write(json.dumps(record_to_json(r)) + "\n")
-    clock[0] = utc(T0 + 3 * CADENCE + 1)
+    clock[0] = utc(T0 + 3 * CADENCE + 1 + cfg.lateness_seconds)
     sink2 = Collector()
     agent2 = EdgeAgent(cfg, [JsonlTailAdapter(log, cfg.state_dir / "source.offset")], post=sink2,
                        clock=lambda: clock[0])
@@ -173,7 +176,7 @@ def test_a_kill_during_the_stop_drain_does_not_count_the_kept_rows_twice(tmp_pat
     kept = json.loads((cfg.state_dir / OPEN_WINDOWS_FILE).read_text())
     assert [len(w["records"]) for w in kept["models"][LOCAL_MODEL]["windows"]] == [20]
 
-    clock[0] = utc(T0 + 2 * CADENCE + 1)
+    clock[0] = utc(T0 + 2 * CADENCE + 1 + cfg.lateness_seconds)
     agent2 = EdgeAgent(cfg, build_sources(spec(folder), cfg.state_dir, "prediction"), post=Collector(),
                        clock=lambda: clock[0])
     assert agent2.open_rows_restored == 20
@@ -181,3 +184,44 @@ def test_a_kill_during_the_stop_drain_does_not_count_the_kept_rows_twice(tmp_pat
     assert agent2.models[LOCAL_MODEL].last_window_end == utc(T0 + 2 * CADENCE).isoformat()
     assert agent2.models[LOCAL_MODEL].collection["rows"] == 20
     agent2.close()
+
+
+def test_a_future_row_is_dropped_and_never_closes_the_open_window(tmp_path):
+    """Audit F6 (edge #6): one row dated a year ahead closed the open window early, the rest of its rows were then
+    dropped as late, and the future window stayed open until a shutdown sent it."""
+    cfg = _cfg(tmp_path)
+    recs = make_stream(1, rows=10)
+    sink, clock = Collector(), [utc(T0)]
+    agent = EdgeAgent(cfg, post=sink, clock=lambda: clock[0])
+    _feed(agent, clock, recs[:5])
+    agent.ingest(dataclasses.replace(recs[0], ts=clock[0] + timedelta(days=365)))
+    _feed(agent, clock, recs[5:])
+    m = agent.status()["models"][LOCAL_MODEL]
+    assert m["future_rows_dropped"] == 1 and m["late_rows_dropped"] == 0
+    assert agent.models[LOCAL_MODEL].cutter.open_buckets() == [T0 // CADENCE]
+    agent.close()
+    assert _ends(sink) == [utc(T0 + CADENCE).isoformat()]
+    assert agent.models[LOCAL_MODEL].collection["rows"] == 10
+
+
+@pytest.mark.parametrize("lateness, kept", [(None, True), (0, False)])
+def test_a_row_two_seconds_late_is_kept_under_the_default_lateness(tmp_path, lateness, kept):
+    """Audit F14 (edge #14): with lateness 0 a row stamped 1 s before the boundary that arrived 2 s late was dropped.
+    The default grace keeps it, whether the window would close by the clock or by a row of the next window;
+    an explicit 0 is still honoured."""
+    cfg = _cfg(tmp_path) if lateness is None else make_cfg(tmp_path, reference_windows=200, min_rows_per_window=5,
+                                                            lateness_seconds=lateness)
+    recs = make_stream(2, rows=10)
+    sink, clock = Collector(), [utc(T0)]
+    agent = EdgeAgent(cfg, post=sink, clock=lambda: clock[0])
+    _feed(agent, clock, recs[:9])                          # window 0 without its last row
+    clock[0] = utc(T0 + CADENCE + 1)
+    agent.tick(clock[0])                                   # the clock has passed the boundary
+    agent.ingest(dataclasses.replace(recs[10], ts=utc(T0 + CADENCE + 1)))     # a row of window 1
+    agent.ingest(dataclasses.replace(recs[9], ts=utc(T0 + CADENCE - 1)))      # 2 s late
+    clock[0] = utc(T0 + CADENCE + cfg.lateness_seconds + 1)
+    agent.tick(clock[0])
+    m = agent.status()["models"][LOCAL_MODEL]
+    assert m["late_rows_dropped"] == (0 if kept else 1)
+    assert agent.models[LOCAL_MODEL].collection["rows"] == (10 if kept else 9)
+    agent.close()

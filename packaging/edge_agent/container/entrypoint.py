@@ -260,6 +260,11 @@ def prepare(argv: list[str], environ: dict[str, str]) -> tuple[list[str], dict[s
         add = load_secrets(environ, secret_var)
         if not cfg.get("endpoints") or not cfg.get("install_id"):
             raise SetupError("config.json needs endpoints and install_id before pairing")
+        from edge_agent.config import require_https_or_loopback
+        try:
+            require_https_or_loopback(cfg["endpoints"][0])
+        except ValueError as exc:
+            raise SetupError(str(exc)) from None
         extra = []
         if cfg.get("ca_file") and "--ca-file" not in rest:              # kitrun6 C-02
             extra += ["--ca-file", str(cfg["ca_file"])]

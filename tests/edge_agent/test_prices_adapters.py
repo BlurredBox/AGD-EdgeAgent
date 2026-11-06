@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 
 from edge_agent.adapters import InProcessAdapter, JsonlTailAdapter
@@ -70,6 +71,43 @@ def test_jsonl_tail_resumes_from_offset_and_waits_for_partial_lines(tmp_path):
         fh.write(line(3)[20:] + "not json\n" + line(4))
     t2 = JsonlTailAdapter(log, tmp_path / "off")                        # restart
     assert [r.features["a"] for r in t2.poll()] == [3, 4] and t2.bad_lines == 1
+
+
+def _rows(ns) -> str:
+    return "".join(json.dumps({"ts": 1700000000 + n, "model_id": "m", "instrument": "i",
+                               "features": {"a": n}, "output": 0.1}) + "\n" for n in ns)
+
+
+def test_jsonl_tail_restarts_when_the_log_is_rotated_to_a_larger_new_file(tmp_path):
+    """Audit F13 (edge #13): a new, larger file under the old name was read from the old byte offset."""
+    log = tmp_path / "m.jsonl"
+    log.write_text(_rows(range(5)))
+    t = JsonlTailAdapter(log, tmp_path / "off")
+    assert len(t.poll()) == 5
+    (tmp_path / "next").write_text(_rows(range(100, 140)))
+    os.replace(tmp_path / "next", log)                                 # logrotate: a new inode under the old name
+    assert [r.features["a"] for r in t.poll()] == list(range(100, 140)) and t.bad_lines == 0
+    assert t.describe()["rotations"] == 1
+
+
+def test_jsonl_tail_restarts_after_copytruncate_across_a_restart(tmp_path):
+    log = tmp_path / "m.jsonl"
+    log.write_text(_rows(range(5)))
+    ino = log.stat().st_ino
+    assert len(JsonlTailAdapter(log, tmp_path / "off").poll()) == 5
+    log.write_text(_rows(range(1000, 1040)))                           # truncated and rewritten in place
+    assert log.stat().st_ino == ino
+    t2 = JsonlTailAdapter(log, tmp_path / "off")                        # restart: the identity is in off.id
+    assert [r.features["a"] for r in t2.poll()] == list(range(1000, 1040)) and t2.bad_lines == 0
+
+
+def test_jsonl_tail_never_resumes_mid_line_from_an_old_format_offset(tmp_path):
+    log = tmp_path / "m.jsonl"
+    log.write_text(_rows(range(3)))
+    (tmp_path / "off").write_text("7")                                  # pre-F13 state: no off.id, not at a line end
+    t = JsonlTailAdapter(log, tmp_path / "off")
+    assert [r.features["a"] for r in t.poll()] == [0, 1, 2] and t.bad_lines == 0
+    assert len(JsonlTailAdapter(log, tmp_path / "off").poll()) == 0     # with off.id saved it resumes at the end
 
 
 def test_in_process_adapter_never_blocks_and_counts_drops():

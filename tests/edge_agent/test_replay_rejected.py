@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 from edge_agent import EdgeAgent
 from edge_agent.replay_rejected import collect, main as replay_main
@@ -46,11 +47,14 @@ def _rejected_run(tmp_path, statuses, n=None):
     clock = [utc(T0)]
     cfg = make_cfg(tmp_path, reference_windows=200, min_rows_per_window=5)
     agent = EdgeAgent(cfg, post=sink, clock=lambda: clock[0])
-    for r in make_stream(n, rows=10):
-        clock[0] = r.ts
-        agent.ingest(r)
-    clock[0] = utc(T0 + (n + 2) * CADENCE)
-    agent.flush()
+    # The live sender now retries 401/403 (edge F4); files in rejected/ from older agents
+    # (and 400/413/422 ones) still exist, so the legacy "retire on 401/403" is simulated here.
+    with patch("edge_agent.transport._AUTH_4XX", frozenset()):
+        for r in make_stream(n, rows=10):
+            clock[0] = r.ts
+            agent.ingest(r)
+        clock[0] = utc(T0 + (n + 2) * CADENCE)
+        agent.flush()
     return cfg, sink, agent
 
 

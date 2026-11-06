@@ -531,7 +531,7 @@ def test_clock_does_not_close_a_window_before_its_folder_rows_are_readable(tmp_p
     agent.close()
 
     plain = EdgeAgent(make_cfg(tmp_path / "b"), [], post=Collector(), clock=lambda: clock[0])
-    assert plain.close_lateness_seconds == 0.0      # a log tail or a database keeps closing at the window end
+    assert plain.close_lateness_seconds == plain.cfg.lateness_seconds   # a log tail or a database: the plain grace
     plain.close()
 
 

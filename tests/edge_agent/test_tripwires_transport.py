@@ -188,3 +188,92 @@ def test_ops_hook_is_filtered_to_the_wire_contract(tmp_path):
     assert set(z) <= wire_fields()
     assert "ops_not_defined_yet" not in z and "unauthorized_deploy_flag" not in z
     assert agent.fields_dropped_by_wire["ops_not_defined_yet"] == 1
+
+
+# --- transport and spool audit (edge F4 F8 F9; audit 21 53 54) --------------------------------
+
+class _Reply(Collector):
+    """Answers `detail`/status per call; raises for models in `down`."""
+    detail: object = {}
+    down: tuple = ()
+
+    def __call__(self, url, path, body, headers):
+        if any(m.encode() in body for m in self.down):
+            raise ConnectionError("down")
+        self.requests.append((url, path, body, dict(headers)))
+        return self.status, ({"accepted": True} if self.status < 300 else {"detail": self.detail})
+
+
+def _put(agent, model, wid, end_s):
+    agent.sender.enqueue({"monitored_model_id": model, "window_id": wid}, utc(T0 + end_s))
+
+
+def test_auth_failure_keeps_window_and_alerts(tmp_path):
+    for status in (401, 403, 404):
+        sink, clock = _Reply(), [utc(T0)]
+        agent = _agent(tmp_path / str(status), sink, clock)
+        sink.status = status
+        _put(agent, "mA", "w1", 0)
+        agent.sender.drain(force=True)
+        assert agent.status()["queued"] == 1 and agent.sender.stats.rejected == 0
+        assert "backend_auth_failed" in kinds(agent)
+
+
+def test_invalid_window_time_422_is_retried_with_alert(tmp_path):
+    sink, clock = _Reply(), [utc(T0)]
+    agent = _agent(tmp_path, sink, clock)
+    sink.status, sink.detail = 422, "invalid_window_time"
+    _put(agent, "mA", "w1", 0)
+    agent.sender.drain(force=True)
+    assert agent.status()["queued"] == 1 and "backend_auth_failed" in kinds(agent)
+
+
+def test_one_models_failure_does_not_block_another(tmp_path):
+    sink, clock = _Reply(), [utc(T0)]
+    sink.down = ("mA",)
+    agent = _agent(tmp_path, sink, clock)
+    _put(agent, "mA", "w1", 0)
+    _put(agent, "mB", "w2", 0)
+    assert agent.sender.drain(force=True) == 1
+    assert agent.status()["queued"] == 1
+    assert b"mB" in sink.requests[0][2]
+
+
+def test_incomplete_spool_file_is_quarantined_not_crashing(tmp_path):
+    sink, clock = _Reply(), [utc(T0)]
+    agent = _agent(tmp_path, sink, clock)
+    bad = agent.sender.spool.root / "mA" / "000000000000001.json"
+    bad.parent.mkdir()
+    bad.write_text('{"body": {}}')
+    _put(agent, "mB", "w2", 0)
+    assert agent.sender.drain(force=True) == 1
+    assert agent.sender.stats.quarantined == 1 and not bad.exists()
+    assert len(list((agent.sender.spool.root / "quarantine").glob("*.json"))) == 1
+    assert agent.sender.drain(force=True) == 0               # does not loop on it
+
+
+def test_same_millisecond_windows_do_not_overwrite(tmp_path):
+    sink, clock = _Reply(), [utc(T0)]
+    agent = _agent(tmp_path, sink, clock)
+    _put(agent, "mA", "w1", 0)
+    _put(agent, "mA", "w2", 0)
+    _put(agent, "mA", "w1", 0)                               # exact re-enqueue stays one file
+    assert agent.status()["queued"] == 2
+
+
+def test_healthy_model_does_not_reset_a_failing_models_backoff_or_signal_recovery(tmp_path):
+    sink, clock = _Reply(), [utc(T0)]
+    sink.down = ("mA",)
+    agent = _agent(tmp_path, sink, clock)
+    agent.alerter.cooldown = 0
+    _put(agent, "mA", "wA", 0)
+    for i in range(4):
+        _put(agent, "mB", f"wB{i}", i + 1)
+        clock[0] = utc(T0 + 1000 * (i + 1))
+        agent.sender.drain(force=True)
+        assert agent.sender._fails == {"mA": i + 1} and agent.sender._link_down
+    assert "link_recovered" not in kinds(agent)
+    assert agent.sender._retry_at["mA"] > clock[0].timestamp()
+    sink.down = ()
+    agent.sender.drain(force=True)
+    assert "link_recovered" in kinds(agent) and agent.sender._fails == {}

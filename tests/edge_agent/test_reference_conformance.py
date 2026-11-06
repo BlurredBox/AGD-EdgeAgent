@@ -43,7 +43,7 @@ def test_edge_reference_equals_corpus_build():
 
     # And the harness yields the same vector from either reference.
     cfg = EdgeConfig(tenant_id="t", install_id="i", models={"m": "w"}, secret="x" * 16,
-                     endpoints=["http://x.invalid"], state_dir="/nonexistent", seed=0)
+                     endpoints=["https://x.invalid"], state_dir="/nonexistent", seed=0)
     cur = _rows(400, 1)
     for r in cur:
         object.__setattr__(r, "features", {**r.features, "a": r.features["a"] + 0.5})
