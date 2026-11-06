@@ -27,7 +27,15 @@ class EdgeConfig:
     max_rows_per_window: int = 5_000        # strided cap for the heavy detectors
     outcome_join_max_records: int = 100_000
     outcome_join_max_age_seconds: float = 7 * 86400
-    lateness_seconds: float = 0.0           # grace before a window is closed by the clock
+    # Grace before a window is closed, by the clock or by a row of a later window (audit F14). 0 closed a window the
+    # instant its end passed, so a row whose log write or flush trailed by a second was dropped as late. 5 s covers
+    # buffered log writes and the 1 s poll with margin, and holds each window open under 2% of the 300 s cadence.
+    # An explicit 0 is honoured.
+    lateness_seconds: float = 5.0
+    # A row stamped further than this ahead of the agent's clock is counted and dropped, never windowed (audit F6):
+    # one such row would close the current window early and leave a future window open. 60 s is the clock-skew
+    # allowance AGD #453 gives the server for window_end.
+    future_tolerance_seconds: float = 60.0
 
     # -- model output semantics
     # "probability": the output is a score in [0, 1]; entropy / positive-decision
@@ -83,6 +91,9 @@ class EdgeConfig:
             self.client_cert = tuple(self.client_cert)
         if self.ca_file is not None and (not isinstance(self.ca_file, str) or not self.ca_file.strip()):
             raise ValueError("ca_file must be a nonempty CA certificate file path")
+        if not (isinstance(self.future_tolerance_seconds, (int, float)) and math.isfinite(self.future_tolerance_seconds)
+                and self.future_tolerance_seconds >= 0):
+            raise ValueError("future_tolerance_seconds must be a number >= 0")
         if self.output_kind not in ("signed", "probability"):
             raise ValueError("output_kind must be 'signed' or 'probability'")
         if self.cadence_seconds < 1 or self.reference_windows < 1:

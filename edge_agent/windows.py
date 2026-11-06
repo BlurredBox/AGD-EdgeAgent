@@ -45,14 +45,15 @@ class WindowCutter:
         s = datetime.fromtimestamp(n * self.cadence, timezone.utc)
         return s, s + timedelta(seconds=self.cadence)
 
-    def add(self, rec: Record) -> list[ClosedWindow]:
-        """Add a record; return every window the record's time closes."""
+    def add(self, rec: Record, lateness_seconds: float = 0.0) -> list[ClosedWindow]:
+        """Add a record; return every window the record's time, less the lateness grace, closes."""
         n = self.bucket(rec.ts)
         if n <= self._closed_upto:
             self.late_dropped += 1
             return []
         self._open.setdefault(n, []).append(rec)
-        return self._close(lambda b: b < n)
+        cutoff = self.bucket(rec.ts - timedelta(seconds=lateness_seconds))
+        return self._close(lambda b: b < cutoff)
 
     def tick(self, now: datetime, lateness_seconds: float = 0.0) -> list[ClosedWindow]:
         """Close windows by the wall clock (a quiet feed must not hold the last window forever)."""

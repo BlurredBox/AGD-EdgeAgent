@@ -9,7 +9,7 @@ import signal
 import threading
 import structlog
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from edge_agent.adapters import SourceAdapter
@@ -58,6 +58,7 @@ class _ModelRuntime:
     labels_missing: bool = False
     invalid: dict[int, dict[str, int]] = field(default_factory=dict)   # bucket -> reason -> n
     late_seen: int = 0
+    future_dropped: int = 0            # rows stamped beyond cfg.future_tolerance_seconds ahead of the clock (F6)
     withheld: int = 0                  # windows sent with statistics withheld by the local quality gate
     emitted: int = 0
     skipped: int = 0
@@ -147,6 +148,13 @@ class EdgeAgent:
                                      key="unknown_model")
             return
         now = self._clock()
+        if rec.ts > now + timedelta(seconds=self.cfg.future_tolerance_seconds):
+            # Audit F6: windowing it would close the current window early and leave a future one open.
+            m.future_dropped += 1
+            self.alerter.raise_alert(SCHEMA_BREAK, rec.model_id,
+                                     "record timestamped in the future (clock or time zone); dropped",
+                                     key="future_ts")
+            return
         if rec.outcome is not None and (rec.outcome_observed_at is None or rec.outcome_observed_at > now):
             raise ValueError("inline outcome must have become known by the ingest clock")
         self._instruments.add(rec.instrument)
@@ -172,7 +180,7 @@ class EdgeAgent:
             return
         if self.proxy is not None:
             self.proxy.add_prediction(rec.model_id, rec.prediction_id, rec.ts)
-        for win in m.cutter.add(rec):
+        for win in m.cutter.add(rec, self.cfg.lateness_seconds):
             self._window(m, win)
 
     def ingest_many(self, recs: list[Record]) -> None:
@@ -571,6 +579,7 @@ class EdgeAgent:
                     "reference_windows": m.signals.n_ref_windows,
                     "emitted": m.emitted, "skipped": m.skipped, "failed": m.failed,
                     "withheld": m.withheld, "late_rows_dropped": m.cutter.late_dropped,
+                    "future_rows_dropped": m.future_dropped,
                     "feed_down": m.feed_down, "labels_missing": m.labels_missing,
                     "last_window_end": m.last_window_end,
                     "collection": m.collection}
